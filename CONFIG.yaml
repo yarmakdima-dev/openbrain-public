@@ -1,0 +1,169 @@
+intent_layer_enabled: false  # Disabled 2026-04-11 - classifier lacks structured param extraction, see BACKLOG.md
+
+app:
+  name: "Open Brain"
+  environment: "production"
+  timezone: "Europe/Warsaw"
+  default_response_language: "same_as_user"
+
+telegram:
+  silent_capture_default: true
+  save_confirmation_text: "✓ Saved"
+  allowed_manual_commands:
+    - "/gpt"
+    - "/claude"
+    - "/gemini"
+    - "/all"
+    - "/ask"
+    - "/askg"
+    - "/search"
+    - "/show"
+    - "/last"
+    - "/tags"
+    - "/tasks"
+    - "/ideas"
+    - "/health"
+    - "/sync"
+    - "/sheet"
+    - "/book"
+    - "/task"
+    - "/idea"
+    - "/person"
+    - "/edit"
+    - "/pull"
+    - "/review"
+    - "/briefing"
+    - "/done"
+
+providers:
+  openai:
+    enabled: true
+    label: "ChatGPT"
+    model: "gpt-4o"
+    role: "execution"
+    strengths:
+      - "structured_output"
+      - "multi_step_tasks"
+      - "polish_language"
+      - "formatted_responses"
+    fallback_order:
+      - "anthropic"
+      - "google"
+
+  anthropic:
+    enabled: true
+    label: "Claude"
+    model: "claude-sonnet-4-6"
+    role: "analysis"
+    strengths:
+      - "deep_reasoning"
+      - "pattern_detection"
+      - "russian_language"
+      - "weekly_reviews"
+    fallback_order:
+      - "openai"
+      - "google"
+
+  google:
+    enabled: true
+    label: "Gemini"
+    model: "gemini-2.5-flash"
+    role: "live_context"
+    strengths:
+      - "calendar_aware"
+      - "german_language"
+      - "realtime_info"
+      - "workspace_integration"
+    fallback_order:
+      - "openai"
+      - "anthropic"
+
+languages:
+  russian:
+    codes: ["ru"]
+    default_provider: "anthropic"
+    learning_mode: false
+
+  english:
+    codes: ["en"]
+    default_provider: "openai"
+    learning_mode: false
+
+  polish:
+    codes: ["pl"]
+    default_provider: "openai"
+    learning_mode: true
+
+  german:
+    codes: ["de"]
+    default_provider: "google"
+    learning_mode: true
+
+routing:
+  default_mode: "silent_capture"
+  auto_route_enabled: false
+  task_type_detection_enabled: false
+  language_detection_enabled: false
+
+  manual_overrides:
+    "/gpt": "openai"
+    "/claude": "anthropic"
+    "/gemini": "google"
+
+  task_type_provider_preferences:
+    execution:
+      - "openai"
+      - "anthropic"
+      - "google"
+    analysis:
+      - "anthropic"
+      - "openai"
+      - "google"
+    realtime:
+      - "google"
+      - "openai"
+      - "anthropic"
+    general:
+      - "openai"
+      - "anthropic"
+      - "google"
+
+memory:
+  embedding_provider: "openai"
+  embedding_model: "text-embedding-3-small"
+  top_k: 5
+  similarity_threshold: 0.75
+
+tagging:
+  enabled: true
+  min_tags: 1
+  max_tags: 3
+
+topics:
+  vocabulary:
+    - openbrain
+    - career
+    - family
+    - health
+    - learning
+    - finance
+    - travel
+    - ideas
+    - admin
+    - other
+
+commands:
+  ask:
+    use_memory: true
+    top_k: 5
+    threshold: 0.75
+    answer_same_language_as_user: true
+    fail_message: "I don't have anything relevant captured about that yet"
+
+  askg:
+    use_memory: false
+    provider: "openai"
+
+health:
+  startup_provider_validation: true
+  expose_command: true

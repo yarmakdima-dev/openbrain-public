@@ -1,0 +1,12 @@
+python-telegram-bot==22.7
+SQLAlchemy==2.0.48
+psycopg[binary]==3.3.3
+python-dotenv==1.2.2
+openai==2.29.0
+anthropic==0.86.0
+google-genai==1.68.0
+PyYAML==6.0.3
+greenlet==3.3.2
+
+gspread==6.2.1
+mcp[cli]==1.26.0

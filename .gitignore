@@ -1,0 +1,31 @@
+# Secrets & credentials
+.env
+.env.*
+*.env
+credentials/
+certs/
+*.key
+*.pem
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data
+logs/
+*.log
+data/
+
+# Manual backup files (replaced by git history going forward)
+*.bak-*
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Private operational files — never publish
+BACKLOG.private.md
+*.crt
+scripts/backfill_topics.py
