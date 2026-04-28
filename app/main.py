@@ -85,7 +85,9 @@ Rules:
 - who must be one of: Я, Юля, Даша, Кирилл, Варя, Брат, Мы, Дети, Друзья, Работа, Книга, Природа, Здоровье.
 - If unclear, use Я.
 - who must always be in Russian.
-- title must be 2-4 words in the same language as the entry.
+- Only choose a non-Я who when that person/category is explicitly present in the entry. Never guess family members from generic tasks.
+- For generic personal tasks with no named person/category, use Я.
+- title must be 2-4 words in the detected language of the entry. For English entries, title must be English even if the content mentions Russian words.
 - language must be one of: ru, en, pl, de.
 - type must be one of: highlight, book, person, idea, task.
 
@@ -501,9 +503,40 @@ def looks_like_reminder_request(user_text: str) -> bool:
     return any(keyword in normalized for keyword in REMINDER_TIME_KEYWORDS)
 
 
+EXPLICIT_CAPTURE_LABELS = {
+    "idea",
+    "ideas",
+    "task",
+    "tasks",
+    "note",
+    "notes",
+    "highlight",
+    "highlights",
+    "review",
+}
+
+
+def looks_like_explicit_capture_entry(user_text: str) -> bool:
+    stripped = (user_text or "").lstrip()
+    if not stripped:
+        return False
+
+    first_line = stripped.splitlines()[0].strip().lower()
+    normalized = normalize_whitespace(stripped).lower()
+    for label in EXPLICIT_CAPTURE_LABELS:
+        if re.match(rf"^{re.escape(label)}\s*[:\-–—]\s+", normalized):
+            return True
+        if first_line == label and len(stripped.splitlines()) > 1:
+            return True
+    return False
+
+
 def classify_message_intent(user_text: str) -> str:
     normalized = normalize_whitespace(user_text).lower()
     if not normalized:
+        return "note"
+
+    if looks_like_explicit_capture_entry(user_text):
         return "note"
 
     if "?" in normalized or "¿" in normalized:
@@ -615,12 +648,15 @@ def infer_type_from_text(entry_text: str) -> str:
 
 def infer_who_from_text(entry_text: str) -> Optional[str]:
     normalized = normalize_whitespace(entry_text).lower()
+    if re.search(r"(?<![а-яё])брат(а|у|ом|е)?(?![а-яё])|(?<![a-z])brother(?![a-z])", normalized):
+        return "Брат"
+
     who_patterns = [
         ("Юля", ["юля", "юле", "юли", "юлей", "julia"]),
         ("Даша", ["даша", "dasha"]),
         ("Кирилл", ["кирил", "kirill"]),
         ("Варя", ["варя", "varia", "varya"]),
-        ("Брат", ["брат", "brother"]),
+        ("Брат", ["brother"]),
         ("Дети", ["дети", "kids", "children"]),
         ("Друзья", ["друз", "friends"]),
         ("Мы", ["мы ", "we "] ),
@@ -669,10 +705,11 @@ def extract_entry_metadata(
 
         if who_override:
             who = who_override
-        elif who not in WHO_CHOICES:
-            who = fallback_who
-        elif inferred_who and who == "Я":
+        elif inferred_who:
+            # Deterministic keyword matches are safer than LLM guesses for this closed field.
             who = inferred_who
+        elif who not in WHO_CHOICES or who != "Я":
+            who = "Я"
 
         if title:
             title = " ".join(title.split()[:4])
