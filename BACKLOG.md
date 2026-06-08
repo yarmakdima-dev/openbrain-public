@@ -1,44 +1,64 @@
-# OpenBrain Roadmap
+# Changelog and Roadmap
 
-OpenBrain is a self-hosted personal knowledge system: a Telegram bot captures text and voice in multiple languages, a PostgreSQL database with pgvector stores entries with semantic search, and an MCP server exposes the memory to external AI tools. A daily briefing and weekly review run on schedule.
+This is a curated public changelog for the sanitized OpenBrain snapshot. It summarizes shipped architecture and product work without exposing private infrastructure, secrets, operational incidents, or personal data.
 
 ## Shipped
 
-- Multilingual capture (4 languages) via Telegram bot
-- PostgreSQL + pgvector storage with hybrid search (vector + keyword)
-- Language-aware LLM routing for tagging and summarization
-- Daily briefing with structured task selection
-- Weekly review
-- Google Sheets bidirectional sync as a visual layer
-- MCP server exposing 11 tools for semantic search, hybrid search, filtered retrieval, counts, topic summaries, and add-entry writes
-- Job observability: `job_runs` table + `/jobs` command for visibility into scheduled runs
-- Two-pass task auto-detection
-- Topic clustering v1 with closed vocabulary
-- Public MCP access with token-based protection
-- Modern Ubuntu deployment with persistent swap
-- Capture trust fix for explicit labels like `Idea:` / `Task:`
-- Metadata quality fix for `who` and entry-language titles
+### April 2026 - Public baseline
 
-## In Progress
+- Initial sanitized public snapshot.
+- Telegram capture, PostgreSQL/pgvector storage, semantic search, and basic MCP read access.
+- MIT license and public README.
 
-- Nothing actively deploying right now.
+### May 2026 - Entry model and retrieval
 
-## Queued
+- Expanded entry model with typed entries such as projects, tasks, ideas, highlights, books, people, reviews, briefings, memory notes, and instructions.
+- Added parent-child linkage between entries.
+- Added English titles/summaries and improved multilingual capture/search behavior.
+- Improved topic clustering and retrieval quality.
 
-- Topic backfill for historical entries
-- Tasks view in Google Sheets
-- Transcript compaction for weekly review
-- End-to-end parent-link verification
-- Weekly review scheduling improvement for DST safety
-- OS upgrade follow-up when the normal upgrader offers it
-- Public repo sync workflow
-- Apple Reminders sync
-- Layered retrieval context (L0/L1/L2 tiers)
-- Temporal fact supersession
+### May 2026 - Google Sheets editing layer
 
-## Principles
+- Reworked Google Sheets sync into a visual editing layer.
+- Added editable per-type tabs: Projects, Books, Highlights, Tasks, Ideas, People.
+- Kept Log/General views as push-only indexes.
+- Added conflict-aware sync support and sync-error visibility.
 
-- Build the capture; rent the intelligence. Don't rebuild what external reasoning layers (Claude via MCP) already do well.
-- Observability before complexity.
-- Git before features.
-- Ship lean, staged foundations before layering.
+### June 2026 - Graph layer and MCP write tools
+
+- Added typed entry relations for graph-like links between entries.
+- Added MCP write tools for controlled LLM-mediated entry creation, updates, and status changes.
+- Added task spawning from ideas and relation-aware workflows.
+- Added public-safe schema migrations and updated app modules.
+
+### June 2026 - Public repo hardening
+
+- Synced the public repo to current sanitized dev state.
+- Added CI security workflow covering secret scanning, static analysis, dependency audit, and lint checks.
+- Verified public snapshot is free of secrets and private infrastructure details.
+
+## Roadmap
+
+### Near term
+
+- Automated public-repo sync workflow with explicit sanitization gates.
+- Better retrieval tiers for recent, semantic, and project-linked context.
+- Temporal supersession: tracking when newer entries replace or refine older ones.
+- Apple Reminders or task-system integration.
+- More robust public documentation and examples.
+
+### Later
+
+- Richer graph exploration over entry relations.
+- Safer autonomous proposal flows, still gated by Dima confirmation.
+- More connectors while keeping OpenBrain as the canonical memory store.
+
+## Not included in the public changelog
+
+This public changelog intentionally excludes:
+
+- Private infrastructure details.
+- Secrets, auth paths, hostnames, IPs, accounts, credentials.
+- Operational incidents.
+- Personal/entity cleanup notes.
+- Internal entry IDs when they refer to private data.
