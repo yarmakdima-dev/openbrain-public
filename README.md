@@ -4,7 +4,7 @@ A self-hosted personal knowledge system. Capture thoughts via Telegram in multip
 
 ## What it does
 
-- **Capture**: Telegram bot accepts text and voice notes in 4 languages (EN, RU, PL, DE). Voice is transcribed via Whisper. Capture is silent by default — the bot acknowledges briefly and stores.
+- **Capture**: Two surfaces, one store. Telegram bot accepts text and voice notes in 4 languages (EN, RU, PL, DE), with voice transcribed via Whisper — capture is silent by default, the bot acknowledges briefly and stores. External LLMs (Claude, ChatGPT) write directly through the MCP server using the same write tools and tagging pipeline, so an entry captured in a chat thread is indistinguishable from one captured on the phone.
 - **Store**: PostgreSQL with pgvector for semantic search. Entries get auto-tagged on capture (who, topic, type, language) via an LLM metadata pass. A typed-edge table (`entry_relations`) tracks how entries connect — `spawned_from`, `continues`, `contradicts` — so the system holds a graph, not just a log.
 - **Retrieve**: Hybrid search (vector + keyword). MCP server exposes the memory as tools to external AI clients (Claude Desktop, ChatGPT, any MCP-speaking tool) — both read tools and write tools (`add_entry`, `update_entry`, `set_status`), with parent-entry linkage so an external assistant can attach notes or maintenance edits to an existing thread of thought.
 - **Proactive**: Daily briefing at a configurable time picks open tasks by urgency. Weekly review summarizes patterns. A Monday triage step surfaces drift across the backlog.
