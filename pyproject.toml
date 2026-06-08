@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = []
+
+[tool.bandit]
+skips = ["B608"]
+exclude_dirs = [".venv", "venv", "tests"]

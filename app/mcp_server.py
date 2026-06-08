@@ -12,6 +12,7 @@ import uvicorn
 from sqlalchemy import create_engine, text
 
 from app.config import get_config
+from app.entity_resolver import resolve_who_to_ids_safe
 from app.main import (
     classify_tags,
     detect_language_bucket,
@@ -55,7 +56,7 @@ mcp = FastMCP(
 )
 
 
-VALID_TYPES = {"highlight", "book", "person", "idea", "task", "review"}
+VALID_TYPES = {"highlight", "book", "person", "idea", "task", "project", "review", "memory_note", "instructions"}
 TOPIC_VOCABULARY = [topic.strip() for topic in cfg.topics.vocabulary if str(topic).strip()]
 VALID_TOPICS = set(TOPIC_VOCABULARY)
 
@@ -65,12 +66,14 @@ def _serialize_entry(row: dict[str, Any]) -> dict[str, Any]:
     updated_at = row.get("updated_at")
     return {
         "id": int(row["id"]),
+        "parent_entry_id": row.get("parent_entry_id"),
         "date": created_at.isoformat() if created_at else None,
         "updated_at": updated_at.isoformat() if updated_at else None,
         "type": row.get("type"),
         "who": row.get("who"),
         "title": row.get("title"),
         "content": row.get("content"),
+        "summary_en": row.get("summary_en"),
         "language": row.get("language"),
         "status": row.get("status"),
         "source": row.get("source"),
@@ -131,7 +134,7 @@ def _fetch_entries_by_ids(entry_ids: list[int]) -> dict[int, dict[str, Any]]:
     placeholders = ", ".join(f":id_{idx}" for idx in range(len(entry_ids)))
     rows = _fetch_entries(
         f"""
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags
         FROM entries
         WHERE id IN ({placeholders})
         """,
@@ -151,6 +154,8 @@ def _insert_entry_returning_id(
     topic: Optional[str],
     status: Optional[str],
     source: str,
+    parent_entry_id: Optional[int] = None,
+    summary_en: Optional[str] = None,
 ) -> int:
     vector_literal = embedding_to_vector_literal(embedding) if embedding else None
     params = {
@@ -164,14 +169,17 @@ def _insert_entry_returning_id(
         "topic": topic,
         "status": status,
         "source": source,
+        "parent_entry_id": parent_entry_id,
+        "summary_en": summary_en,
     }
     with engine.begin() as conn:
+        params["who_ids"] = resolve_who_to_ids_safe(who, conn)
         if vector_literal:
             row_id = conn.execute(
                 text(
                     """
-                    INSERT INTO entries (content, embedding, tags, who, title, language, type, topic, status, source)
-                    VALUES (:content, CAST(:embedding AS vector), :tags, :who, :title, :language, :entry_type, :topic, :status, :source)
+                    INSERT INTO entries (content, embedding, tags, who, who_ids, title, language, type, topic, status, source, parent_entry_id, summary_en)
+                    VALUES (:content, CAST(:embedding AS vector), :tags, :who, :who_ids, :title, :language, :entry_type, :topic, :status, :source, :parent_entry_id, :summary_en)
                     RETURNING id
                     """
                 ),
@@ -181,8 +189,8 @@ def _insert_entry_returning_id(
             row_id = conn.execute(
                 text(
                     """
-                    INSERT INTO entries (content, tags, who, title, language, type, topic, status, source)
-                    VALUES (:content, :tags, :who, :title, :language, :entry_type, :topic, :status, :source)
+                    INSERT INTO entries (content, tags, who, who_ids, title, language, type, topic, status, source, parent_entry_id, summary_en)
+                    VALUES (:content, :tags, :who, :who_ids, :title, :language, :entry_type, :topic, :status, :source, :parent_entry_id, :summary_en)
                     RETURNING id
                     """
                 ),
@@ -206,7 +214,7 @@ def search_memory(query: str) -> dict[str, Any]:
     vector_literal = embedding_to_vector_literal(query_embedding)
     rows = _fetch_entries(
         """
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags,
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags,
                1 - (embedding <=> CAST(:embedding AS vector)) AS relevance
         FROM entries
         WHERE embedding IS NOT NULL
@@ -231,7 +239,7 @@ def recent_entries(days: int = 7, date_from: Optional[str] = None, date_to: Opti
         return error
 
     sql = """
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags
         FROM entries
         WHERE 1=1
     """
@@ -261,7 +269,7 @@ def search_by_type(entry_type: str, status: Optional[str] = None) -> dict[str, A
         return {"error": f"Invalid type: {entry_type}", "valid_types": sorted(VALID_TYPES)}
 
     sql = """
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, parent_entry_id, tags
         FROM entries
         WHERE type = :entry_type
     """
@@ -282,7 +290,7 @@ def search_by_who(who: str) -> dict[str, Any]:
         return {"error": "who is required."}
     rows = _fetch_entries(
         """
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags
         FROM entries
         WHERE who = :who
         ORDER BY created_at ASC, id ASC
@@ -293,7 +301,7 @@ def search_by_who(who: str) -> dict[str, Any]:
 
 
 @mcp.tool(description="Add a journal entry with auto-metadata, tags, topic, and embedding. Writes a new row to the database. [writes to DB]")
-def add_entry(content: str, entry_type: Optional[str] = None, who: Optional[str] = None) -> dict[str, Any]:
+def add_entry(content: str, entry_type: Optional[str] = None, who: Optional[str] = None, parent_entry_id: Optional[int] = None) -> dict[str, Any]:
     """Add a new journal entry with auto-tagging and embeddings."""
     content = (content or "").strip()
     if not content:
@@ -308,7 +316,8 @@ def add_entry(content: str, entry_type: Optional[str] = None, who: Optional[str]
         metadata["who"] = who.strip()
     if not metadata.get("language"):
         metadata["language"] = detect_language_bucket(content)
-    tags = classify_tags(content)
+    saved_type = metadata.get("type") or forced_type or "highlight"
+    tags = classify_tags(content, saved_type)
 
     embedding = None
     try:
@@ -316,7 +325,6 @@ def add_entry(content: str, entry_type: Optional[str] = None, who: Optional[str]
     except Exception as exc:
         logger.warning("Embedding failed in MCP add_entry; saving without embedding: %s", exc)
 
-    saved_type = metadata.get("type") or forced_type or "highlight"
     status = "open" if saved_type == "task" else None
     entry_id = _insert_entry_returning_id(
         content=content,
@@ -329,6 +337,8 @@ def add_entry(content: str, entry_type: Optional[str] = None, who: Optional[str]
         topic=metadata.get("topic"),
         status=status,
         source="mcp",
+        parent_entry_id=parent_entry_id,
+        summary_en=metadata.get("summary_en"),
     )
     return {
         "ok": True,
@@ -338,6 +348,8 @@ def add_entry(content: str, entry_type: Optional[str] = None, who: Optional[str]
         "language": metadata.get("language"),
         "type": saved_type,
         "topic": metadata.get("topic"),
+        "summary_en": metadata.get("summary_en"),
+        "parent_entry_id": parent_entry_id,
         "status": status,
         "tags": tags,
     }
@@ -350,7 +362,7 @@ def get_summary(days: int = 7) -> dict[str, Any]:
     since = datetime.utcnow() - timedelta(days=days)
     entries = _fetch_entries(
         """
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags
         FROM entries
         WHERE created_at >= :since
         ORDER BY created_at ASC, id ASC
@@ -402,7 +414,7 @@ def get_summary(days: int = 7) -> dict[str, Any]:
 def get_entry_by_id(entry_id: int) -> dict[str, Any]:
     rows = _fetch_entries(
         """
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, parent_entry_id, tags
         FROM entries
         WHERE id = :entry_id
         """,
@@ -411,6 +423,99 @@ def get_entry_by_id(entry_id: int) -> dict[str, Any]:
     if not rows:
         return {"found": False}
     return {"found": True, "entry": _serialize_entry(rows[0])}
+
+
+@mcp.tool(description="Update an existing entry's content by id. Content only — does NOT re-derive title/summary/tags/type and does NOT re-embed, so those fields and vector search relevance may go stale after an update. updated_at is set automatically. [writes to DB]")
+def update_entry(entry_id: int, content: str) -> dict[str, Any]:
+    content = (content or "").strip()
+    if not content:
+        return {"ok": False, "error": "content must be non-empty"}
+
+    existing = _fetch_entries(
+        """
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags
+        FROM entries
+        WHERE id = :entry_id
+        """,
+        {"entry_id": int(entry_id)},
+    )
+    if not existing:
+        return {"ok": False, "error": f"entry {int(entry_id)} not found"}
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                UPDATE entries
+                SET content = :content
+                WHERE id = :entry_id
+                RETURNING id, type, who, title, status, updated_at
+                """
+            ),
+            {"entry_id": int(entry_id), "content": content},
+        ).mappings().one()
+
+    updated_at = row.get("updated_at")
+    return {
+        "ok": True,
+        "entry_id": int(row["id"]),
+        "type": row.get("type"),
+        "who": row.get("who"),
+        "title": row.get("title"),
+        "status": row.get("status"),
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
+
+
+@mcp.tool(description="Set an existing entry's status to open/done/archived or clear it to null. Content/title/summary/tags/embedding are untouched; works on any entry type including project. [writes to DB]")
+def set_status(entry_id: int, status: str | None = None) -> dict[str, Any]:
+    if status is None:
+        normalized_status = None
+    else:
+        normalized_status = str(status).strip().lower()
+        if normalized_status == "null":
+            normalized_status = None
+
+    if normalized_status not in {"open", "done", "archived", None}:
+        return {
+            "ok": False,
+            "error": f"invalid status: {status}; allowed: open, done, archived, null",
+            "entry_id": int(entry_id),
+        }
+
+    existing = _fetch_entries(
+        """
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags
+        FROM entries
+        WHERE id = :entry_id
+        """,
+        {"entry_id": int(entry_id)},
+    )
+    if not existing:
+        return {"ok": False, "error": f"entry {int(entry_id)} not found"}
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                UPDATE entries
+                SET status = :status
+                WHERE id = :entry_id
+                RETURNING id, type, who, status, updated_at
+                """
+            ),
+            {"entry_id": int(entry_id), "status": normalized_status},
+        ).mappings().one()
+
+    updated_at = row.get("updated_at")
+    return {
+        "ok": True,
+        "entry_id": int(row["id"]),
+        "type": row.get("type"),
+        "who": row.get("who"),
+        "status": row.get("status"),
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
 
 
 @mcp.tool(description="Hybrid search combining vector similarity and keyword match. Better than pure semantic for proper nouns, IDs, and exact phrases. [read-only]")
@@ -451,7 +556,7 @@ def recent_by_topic(topic: str, days: int = 30, limit: int = 50) -> dict[str, An
     since = datetime.utcnow() - timedelta(days=bounded_days)
     rows = _fetch_entries(
         """
-        SELECT id, created_at, updated_at, type, who, title, content, language, status, source, tags
+        SELECT id, created_at, updated_at, type, who, title, content, summary_en, language, status, source, tags
         FROM entries
         WHERE topic = :topic
           AND created_at >= :since

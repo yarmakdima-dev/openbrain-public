@@ -29,3 +29,4 @@ Thumbs.db
 BACKLOG.private.md
 *.crt
 scripts/backfill_topics.py
+backups/

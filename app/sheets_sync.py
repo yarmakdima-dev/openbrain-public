@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -14,6 +14,14 @@ from openai import OpenAI
 from sqlalchemy import create_engine, text
 
 from app.config import get_config
+from app.entity_resolver import resolve_who_to_ids_safe
+from app.sheet_sync_common import (
+    clear_sync_error,
+    fetch_snapshots,
+    set_sync_error,
+    three_way_resolve,
+    write_snapshots,
+)
 
 load_dotenv()
 cfg = get_config()
@@ -25,9 +33,11 @@ GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_EMBEDDING_MODEL = cfg.memory.embedding_model
 APP_TZ = ZoneInfo(cfg.app.timezone)
-VALID_TYPES = {"highlight", "book", "person", "idea", "task", "review", "briefing"}
+VALID_TYPES = {"highlight", "book", "person", "idea", "task", "review", "briefing", "memory_note", "instructions"}
 
 SHEET_HEADERS = ["Date", "Type", "Who", "Title", "Full Entry", "DB_ID", "Synced"]
+GENERAL_SNAPSHOT_FIELDS = ["type", "who", "title", "content"]
+GENERAL_TAB_NAME = "general"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -40,6 +50,34 @@ class SyncResult:
     updated_count: int
     pulled_count: int
     sheet_url: str
+
+
+@dataclass
+class GeneralSyncResult:
+    pulled_updated: int = 0
+    pulled_skipped: int = 0
+    conflicts: list[int] = field(default_factory=list)
+    pushed: int = 0
+    error: Optional[str] = None
+
+    @property
+    def pulled_count(self) -> int:
+        return self.pulled_updated
+
+    @property
+    def synced_count(self) -> int:
+        return self.pushed
+
+    @property
+    def updated_count(self) -> int:
+        return 0
+
+    @property
+    def sheet_url(self) -> str:
+        return GOOGLE_SHEET_URL
+
+    def __str__(self) -> str:
+        return str(self.pulled_updated)
 
 
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
@@ -189,126 +227,129 @@ def _embedding_to_vector_literal(embedding: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
 
 
-def _update_database_from_sheet(entry_id: int, entry: dict[str, Any], sheet_row: list[str]) -> list[str]:
-    sheet_type = _normalize_type(sheet_row[1], entry.get("type") or "highlight")
-    sheet_who = (sheet_row[2] or "").strip() or (entry.get("who") or "")
-    sheet_title = (sheet_row[3] or "").strip() or (entry.get("title") or "")
-    sheet_content = (sheet_row[4] or "").strip() or (entry.get("content") or "")
-
-    changed_fields: list[str] = []
-    if sheet_content != (entry.get("content") or ""):
-        changed_fields.append("Full Entry")
-    if sheet_who != (entry.get("who") or ""):
-        changed_fields.append("Who")
-    if sheet_title != (entry.get("title") or ""):
-        changed_fields.append("Title")
-    if sheet_type != (entry.get("type") or "highlight"):
-        changed_fields.append("Type")
-
-    if not changed_fields:
-        return []
-
-    # The Synced column records the last sync moment, not the user's sheet edit time.
-    # If fields differ, trust the sheet values on reverse sync instead of treating Synced
-    # as a conflict timestamp. Otherwise real sheet edits can be skipped incorrectly.
-
-    try:
-        embedding = _get_openai_embedding(sheet_content)
-    except Exception as exc:
-        logger.warning(
-            "Embedding regeneration failed during reverse sync for entry #%s: %s",
-            entry_id,
-            exc,
-        )
-        embedding = None
-
-    status = entry.get("status")
-    if sheet_type == "task" and not status:
-        status = "open"
-    elif sheet_type != "task":
-        status = None
-
-    params = {
-        "entry_id": entry_id,
-        "content": sheet_content,
-        "who": sheet_who or None,
-        "title": sheet_title or None,
-        "entry_type": sheet_type,
-        "status": status,
-        "tags": entry.get("tags") or ["General"],
-        "topic": entry.get("topic"),
-        "embedding": _embedding_to_vector_literal(embedding) if embedding else None,
+def _parse_general_sheet_values(entry: dict[str, Any], sheet_row: list[str]) -> dict[str, Any]:
+    return {
+        "type": _normalize_type(sheet_row[1], entry.get("type") or "highlight"),
+        "who": (sheet_row[2] or "").strip() or None,
+        "title": (sheet_row[3] or "").strip() or None,
+        "content": (sheet_row[4] or "").strip(),
     }
 
-    with engine.begin() as conn:
-        if embedding is not None:
-            conn.execute(
-                text(
-                    """
-                    UPDATE entries
-                    SET content = :content,
-                        who = :who,
-                        title = :title,
-                        type = :entry_type,
-                        status = :status,
-                        tags = :tags,
-                        topic = :topic,
-                        embedding = CAST(:embedding AS vector)
-                    WHERE id = :entry_id
-                    """
-                ),
-                params,
-            )
-        else:
-            conn.execute(
-                text(
-                    """
-                    UPDATE entries
-                    SET content = :content,
-                        who = :who,
-                        title = :title,
-                        type = :entry_type,
-                        status = :status,
-                        tags = :tags,
-                        topic = :topic,
-                        embedding = NULL
-                    WHERE id = :entry_id
-                    """
-                ),
-                params,
-            )
 
-    logger.info("Reverse synced entry #%s: updated %s", entry_id, ", ".join(changed_fields))
-    return changed_fields
+def _general_db_values(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": entry.get("type") or "highlight",
+        "who": entry.get("who"),
+        "title": entry.get("title"),
+        "content": entry.get("content") or "",
+    }
 
 
-def pull_sheet_updates_to_database() -> int:
+def pull_sheet_updates_to_database() -> GeneralSyncResult:
+    # Currently unused: Log/General is read-only under Option 2; both former callers (orchestrator + /pull) removed.
     ensure_sync_schema()
     worksheet = _open_worksheet()
     _ensure_header_row(worksheet)
     existing_rows = _get_existing_sheet_rows(worksheet)
     entry_map = _fetch_entry_map()
+    row_ids = [entry_id for entry_id in existing_rows if entry_id in entry_map]
+    with engine.begin() as conn:
+        snapshots = fetch_snapshots(conn, GENERAL_TAB_NAME, row_ids)
     synced_now = datetime.now(tz=APP_TZ)
     sync_updates: list[dict[str, Any]] = []
-    pulled_count = 0
+    result = GeneralSyncResult()
 
     for entry_id, (row_index, row_values) in existing_rows.items():
-        entry = entry_map.get(entry_id)
-        if not entry:
-            continue
-        changed_fields = _update_database_from_sheet(entry_id, entry, row_values)
-        if changed_fields:
-            pulled_count += 1
+        try:
+            entry = entry_map.get(entry_id)
+            if not entry:
+                result.pulled_skipped += 1
+                continue
+
+            snapshot = snapshots.get(entry_id)
+            if snapshot is None:
+                result.pulled_skipped += 1
+                continue
+
+            sheet_values = _parse_general_sheet_values(entry, row_values)
+            db_values = _general_db_values(entry)
+            decisions: dict[str, tuple[str, Any]] = {}
+            conflict_fields: list[str] = []
+            for field in GENERAL_SNAPSHOT_FIELDS:
+                decision, value = three_way_resolve(field, snapshot.get(field), sheet_values[field], db_values[field])
+                decisions[field] = (decision, value)
+                if decision == "conflict":
+                    conflict_fields.append(field)
+
+            with engine.begin() as conn:
+                if conflict_fields:
+                    message = "General tab conflict — " + "; ".join(
+                        f"{field}: sheet={sheet_values[field]!r}, db={db_values[field]!r}"
+                        for field in conflict_fields
+                    )
+                    set_sync_error(conn, "entries", entry_id, message)
+                    result.conflicts.append(entry_id)
+                    result.pulled_skipped += 1
+                    continue
+
+                sheet_wins = {
+                    field: value
+                    for field, (decision, value) in decisions.items()
+                    if decision == "take_sheet"
+                }
+                if not sheet_wins:
+                    clear_sync_error(conn, "entries", entry_id)
+                    continue
+
+                set_clauses: list[str] = []
+                params: dict[str, Any] = {"entry_id": entry_id}
+                for field in GENERAL_SNAPSHOT_FIELDS:
+                    if field not in sheet_wins:
+                        continue
+                    params[field] = sheet_wins[field]
+                    set_clauses.append(f"{field} = :{field}")
+
+                if "who" in sheet_wins:
+                    params["who_ids"] = resolve_who_to_ids_safe(sheet_wins.get("who"), conn)
+                    set_clauses.append("who_ids = :who_ids")
+
+                if "content" in sheet_wins:
+                    try:
+                        embedding = _get_openai_embedding(sheet_wins["content"])
+                    except Exception as exc:
+                        logger.warning(
+                            "Embedding regeneration failed during reverse sync for entry #%s: %s",
+                            entry_id,
+                            exc,
+                        )
+                        embedding = None
+                    if embedding is not None:
+                        params["embedding"] = _embedding_to_vector_literal(embedding)
+                        set_clauses.append("embedding = CAST(:embedding AS vector)")
+                    else:
+                        set_clauses.append("embedding = NULL")
+
+                set_clauses.append("updated_at = NOW()")
+                conn.execute(
+                    text(f"UPDATE entries SET {', '.join(set_clauses)} WHERE id = :entry_id"),
+                    params,
+                )
+                clear_sync_error(conn, "entries", entry_id)
+
+            result.pulled_updated += 1
             sync_updates.append({
                 "range": f"G{row_index}:G{row_index}",
                 "values": [[_format_synced_timestamp(synced_now)]],
             })
+        except Exception:
+            logger.exception("General reverse sync failed for entry #%s; continuing", entry_id)
+            result.pulled_skipped += 1
 
     if sync_updates:
         worksheet.batch_update(sync_updates, value_input_option="RAW")
 
-    logger.info("Google Sheets reverse sync finished: %s updated database rows", pulled_count)
-    return pulled_count
+    logger.info("Google Sheets reverse sync finished: %s updated database rows", result.pulled_updated)
+    return result
 
 
 def reset_google_sheet_from_database() -> SyncResult:
@@ -351,30 +392,44 @@ def sync_entries_to_google_sheet() -> SyncResult:
     if rows_to_append:
         worksheet.append_rows(rows_to_append, value_input_option="RAW")
 
+    with engine.begin() as conn:
+        snapshot_rows = [
+            {
+                "id": entry["id"],
+                "type": entry.get("type"),
+                "who": entry.get("who"),
+                "title": entry.get("title"),
+                "content": entry.get("content"),
+            }
+            for entry in entries
+        ]
+        snapshots_written = write_snapshots(
+            conn,
+            GENERAL_TAB_NAME,
+            "entries",
+            snapshot_rows,
+            GENERAL_SNAPSHOT_FIELDS,
+        )
+
     logger.info(
-        "Google Sheets forward sync finished: %s new rows, %s updated rows",
+        "Google Sheets forward sync finished: %s new rows, %s updated rows, %s snapshots",
         len(rows_to_append),
         len(rows_to_update),
+        snapshots_written,
     )
     return SyncResult(
-        synced_count=len(rows_to_append),
+        synced_count=snapshots_written,
         updated_count=len(rows_to_update),
         pulled_count=0,
         sheet_url=GOOGLE_SHEET_URL,
     )
 
 
-def sync_google_sheet_bidirectional() -> SyncResult:
-    pulled_count = 0
-    try:
-        pulled_count = pull_sheet_updates_to_database()
-    except Exception:
-        logger.exception("Reverse sync failed; continuing with forward sync")
+def sync_google_sheet_bidirectional() -> GeneralSyncResult:
+    result = GeneralSyncResult()
+    # Log/General tab is read-only (Option 2): reverse-sync disabled, push-only DB->sheet.
+    logger.info("Log/General reverse-sync disabled (read-only, Option 2); skipping sheet->DB write-back")
 
     forward_result = sync_entries_to_google_sheet()
-    return SyncResult(
-        synced_count=forward_result.synced_count,
-        updated_count=forward_result.updated_count,
-        pulled_count=pulled_count,
-        sheet_url=forward_result.sheet_url,
-    )
+    result.pushed = forward_result.synced_count
+    return result

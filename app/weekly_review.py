@@ -19,6 +19,7 @@ from sqlalchemy import create_engine, text
 from telegram import Bot
 
 from app.config import get_config
+from app.entity_resolver import resolve_who_to_ids_safe
 
 load_dotenv()
 cfg = get_config()
@@ -685,6 +686,7 @@ def save_review_entry(review_text: str, start_dt: datetime, end_dt: datetime) ->
         "source": "review",
     }
     with engine.begin() as conn:
+        params["who_ids"] = resolve_who_to_ids_safe(params.get("who"), conn)
         existing = conn.execute(
             text("SELECT id FROM entries WHERE source = 'review' AND title = :title ORDER BY id DESC LIMIT 1"),
             {"title": title},
@@ -699,6 +701,7 @@ def save_review_entry(review_text: str, start_dt: datetime, end_dt: datetime) ->
                             embedding = CAST(:embedding AS vector),
                             tags = :tags,
                             who = :who,
+                            who_ids = :who_ids,
                             language = :language,
                             type = :entry_type,
                             status = :status,
@@ -717,6 +720,7 @@ def save_review_entry(review_text: str, start_dt: datetime, end_dt: datetime) ->
                             embedding = NULL,
                             tags = :tags,
                             who = :who,
+                            who_ids = :who_ids,
                             language = :language,
                             type = :entry_type,
                             status = :status,
@@ -731,8 +735,8 @@ def save_review_entry(review_text: str, start_dt: datetime, end_dt: datetime) ->
             result = conn.execute(
                 text(
                     """
-                    INSERT INTO entries (title, content, embedding, tags, who, language, type, status, source)
-                    VALUES (:title, :content, CAST(:embedding AS vector), :tags, :who, :language, :entry_type, :status, :source)
+                    INSERT INTO entries (title, content, embedding, tags, who, who_ids, language, type, status, source)
+                    VALUES (:title, :content, CAST(:embedding AS vector), :tags, :who, :who_ids, :language, :entry_type, :status, :source)
                     RETURNING id
                     """
                 ),
@@ -742,8 +746,8 @@ def save_review_entry(review_text: str, start_dt: datetime, end_dt: datetime) ->
             result = conn.execute(
                 text(
                     """
-                    INSERT INTO entries (title, content, tags, who, language, type, status, source)
-                    VALUES (:title, :content, :tags, :who, :language, :entry_type, :status, :source)
+                    INSERT INTO entries (title, content, tags, who, who_ids, language, type, status, source)
+                    VALUES (:title, :content, :tags, :who, :who_ids, :language, :entry_type, :status, :source)
                     RETURNING id
                     """
                 ),

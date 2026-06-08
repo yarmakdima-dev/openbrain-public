@@ -1,68 +1,92 @@
 # OpenBrain
 
-A self-hosted personal knowledge system. Capture thoughts via Telegram in multiple languages, store them with semantic search, and query them from any AI tool via MCP.
+OpenBrain is a self-hosted personal knowledge system. It captures thoughts from lightweight surfaces, stores them in PostgreSQL with semantic search, and exposes the memory to external AI tools through the Model Context Protocol (MCP).
 
-## What it does
+The project is intentionally small in scope: OpenBrain stores durable memory and operational context; LLMs provide reasoning through tools.
 
-- **Capture**: Two surfaces, one store. Telegram bot accepts text and voice notes in 4 languages (EN, RU, PL, DE), with voice transcribed via Whisper — capture is silent by default, the bot acknowledges briefly and stores. External LLMs (Claude, ChatGPT) write directly through the MCP server using the same write tools and tagging pipeline, so an entry captured in a chat thread is indistinguishable from one captured on the phone.
-- **Store**: PostgreSQL with pgvector for semantic search. Entries get auto-tagged on capture (who, topic, type, language) via an LLM metadata pass. A typed-edge table (`entry_relations`) tracks how entries connect — `spawned_from`, `continues`, `contradicts` — so the system holds a graph, not just a log.
-- **Retrieve**: Hybrid search (vector + keyword). MCP server exposes the memory as tools to external AI clients (Claude Desktop, ChatGPT, any MCP-speaking tool) — both read tools and write tools (`add_entry`, `update_entry`, `set_status`), with parent-entry linkage so an external assistant can attach notes or maintenance edits to an existing thread of thought.
-- **Proactive**: Daily briefing at a configurable time picks open tasks by urgency. Weekly review summarizes patterns. A Monday triage step surfaces drift across the backlog.
-- **Visual layer**: Google Sheets sync. The Log and General tabs are push-only — read in Sheets, edit in DB. Six per-type tabs (Projects, Books, Highlights, Tasks, Ideas, People) sync bidirectionally with a 3-way merge between DB state, last-known snapshot, and current Sheet state — conflicts are surfaced per entry, not silently overwritten.
+## What It Does
+
+- **Capture:** Telegram text and voice messages become entries. Voice notes are transcribed with Whisper, and capture remains available even if downstream AI services are unavailable.
+- **Recognize:** Entries are typed, summarized in English, tagged, embedded for vector search, and assigned metadata such as language, topic, title, status, and people references.
+- **Connect:** `parent_entry_id` models hierarchy, while `entry_relations` stores typed directional edges such as `spawned_from`, `continues`, and `contradicts`.
+- **Retrieve:** MCP tools provide semantic search, hybrid search, filtered retrieval, topic summaries, counts, and entry lookup by ID.
+- **Write:** MCP write tools can add entries, update entry content, and set entry status. These write paths are designed for user-confirmed assistant workflows.
+- **Sync:** Google Sheets acts as a visual editing layer. Log and General tabs are push-only DB indexes; Projects, Books, Highlights, Tasks, Ideas, and People are editable tabs with 3-way merge conflict handling.
 
 ## Architecture
 
-- **Language**: Python 3.11+
-- **Database**: PostgreSQL 16 with pgvector extension (runs in Docker)
-- **LLMs**: OpenAI (EN/PL), Anthropic (RU), Gemini (DE) — language-routed. Small model for tagging (`gpt-4o-mini`), larger for weekly review.
-- **Embeddings**: OpenAI `text-embedding-3-small`
-- **Capture**: Telegram bot via `python-telegram-bot`
-- **Transcription**: OpenAI Whisper API
-- **Scheduler**: systemd timers + APScheduler
-- **MCP**: HTTPS endpoint behind nginx with URL-path token auth. Exposes read tools (search, count, get-by-id, recent-by-topic, recent-by-date, hybrid search, summaries) and write tools (add, update, set status) with `parent_entry_id` linkage for hierarchical capture.
-- **Sync**: 3-way merge between DB ↔ Sheets per editable tab. Conflicts written to a `sync_error` column and surfaced in the Sheet.
+- **Database:** PostgreSQL with pgvector.
+- **Bot:** Telegram capture service for text and voice.
+- **MCP server:** FastMCP service exposing read and write tools to MCP-speaking clients.
+- **Sheets sync:** per-tab sync modules with snapshots and `sync_error` conflict reporting.
+- **LLM providers:** OpenAI, Anthropic, and Google clients are wired through environment variables.
 
-## Design decisions
+The core design principle is one canonical store. Telegram, Sheets, scripts, and MCP all converge on the database rather than maintaining separate memories.
 
-- **Whisper API, not local**: target VPS is small (1 core / 1.9GB RAM). Local Whisper was not feasible.
-- **Capture surface stays narrow**: Telegram is capture-only. Reasoning, search, and maintenance happen via Claude / ChatGPT through MCP. An earlier intent-layer design that put query and command inside Telegram was built, then abandoned — Claude is a better query interface than anything built in Telegram, and MCP exposes the DB natively.
-- **Two-pass task detection**: conservative extraction. False positives are worse than false negatives for a trust-based system.
-- **Structured output for briefings**: the LLM picks entry IDs only; displayed text is templated from the DB. Eliminates cross-section ID misbinding by construction, not by prompt discipline.
-- **Google Sheets as the visual layer, not a custom web UI**: users who already live in spreadsheets get a familiar surface. Editable tabs use a 3-way merge rather than last-write-wins — a Sheet edit and a DB update during the same sync window surface as a conflict instead of silently dropping one.
-- **Build the capture, rent the intelligence**: build only what off-the-shelf AI can't do — capture surfaces, proactive triggers, persistent multilingual storage. Reasoning and query are rented from external LLMs via MCP.
-- **One canonical store, multiple LLMs**: structured so the same knowledge base serves Claude, ChatGPT, and any future MCP-speaking tool as a shared source of truth. Avoids each assistant keeping its own divergent partial view.
+## Entry Model
 
-## Setup
+Entries can represent highlights, books, people, ideas, tasks, projects, reviews, briefings, memory notes, or instructions. The schema is deliberately flexible: entry type is data, not a hard database enum.
 
-This is a working system, not a polished template. Setup requires:
+Relationship modeling uses two layers:
 
-1. A Linux host with Docker and Python 3.11+.
-2. API keys: OpenAI, Anthropic, Google (Gemini + Sheets), Telegram bot token.
-3. A Telegram bot created via BotFather.
-4. PostgreSQL with pgvector (provided via `docker-compose.yml`).
-5. Google Cloud service account for Sheets access.
-6. A `.env` file with all secrets (derive from `app/config.py` and `CONFIG.yaml`).
-7. Run SQL migrations in `sql/` in order.
-8. Systemd units for the bot and MCP server (not included — host-specific).
+- `parent_entry_id` for hierarchical capture, such as notes or tasks attached to a project.
+- `entry_relations` for typed graph edges between entries.
 
-This repo is shared as a reference implementation, not a one-click installer. If you want to run it, expect to read the code.
+This lets OpenBrain behave as a graph of memory rather than only a chronological log.
 
-## Repository layout
+## Google Sheets Sync
 
-- `app/` — bot, scheduler, LLM routing, MCP server, sync logic
-- `scripts/` — operational scripts (sync to Sheets, config checks)
-- `sql/` — schema migrations
-- `CONFIG.yaml` — non-secret configuration (models, schedules, topic vocabulary)
-- `docker-compose.yml` — PostgreSQL + pgvector
-- `requirements.txt` — Python dependencies
-- `BACKLOG.md` — shipped and in-progress work
+The sync layer uses a snapshot-based 3-way merge:
 
-## Status
+- Sheet unchanged, DB unchanged: no-op.
+- Sheet changed, DB unchanged: sheet edit wins.
+- Sheet unchanged, DB changed: DB edit wins and the next push updates the sheet.
+- Both changed to the same value: accept consensus.
+- Both changed differently: skip the row and write a conflict message to `sync_error`.
 
-Active personal project, public for transparency and reference. This repo is a sanitized snapshot of an actively-developed private repo; updates land in batches, not continuously.
+Conflict messages are surfaced in the Sheet as a visible problem column.
 
-Current direction: structuring the knowledge base so multiple LLMs (Claude, ChatGPT) share it as canonical state — each LLM keeps a small "hot cache" of native memory; OpenBrain holds the durable source of truth across all of them.
+## MCP Tools
 
-## License
+The MCP server exposes read tools for search and retrieval, plus write tools for controlled maintenance:
 
-MIT. See [LICENSE](LICENSE).
+- `add_entry`
+- `update_entry`
+- `set_status`
+- `search_memory`
+- `hybrid_search`
+- `get_entry_by_id`
+- `search_by_type`
+- `search_by_who`
+- `recent_entries`
+- `recent_by_topic`
+- `get_summary`
+- `list_topics_with_counts`
+- `count_entries`
+
+Public deployments should put the MCP service behind HTTPS and authentication. This repository keeps deployment-specific hostnames, tokens, credentials, and runtime paths out of source control.
+
+## Repository Layout
+
+- `app/` — bot, MCP server, sync modules, LLM clients, entity resolution, and relation helpers.
+- `sql/` — base schema.
+- `migrations/` and `db/migrations/` — incremental schema changes.
+- `scripts/` — maintenance and backfill scripts.
+- `CONFIG.yaml` — non-secret runtime configuration.
+- `docker-compose.yml` — local database service definition.
+
+## Running Locally
+
+This repository is a sanitized public snapshot. To run it, provide your own environment variables and service-account credentials.
+
+Typical requirements:
+
+1. PostgreSQL with pgvector.
+2. Python dependencies from `requirements.txt`.
+3. API keys for whichever LLM providers you enable.
+4. Telegram bot credentials if using Telegram capture.
+5. Google Sheets credentials if using sheet sync.
+6. TLS/authentication configuration if exposing MCP outside localhost.
+
+Do not commit `.env` files, service-account JSON, private keys, database dumps, logs, or host-specific operational files.
+

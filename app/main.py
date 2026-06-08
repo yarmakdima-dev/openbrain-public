@@ -20,6 +20,7 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -27,16 +28,26 @@ from telegram.ext import (
 )
 
 from app.config import get_config
+from app.entity_resolver import resolve_who_to_ids_safe
 from app.sheets_sync import (
     GOOGLE_SHEET_URL,
-    pull_sheet_updates_to_database,
     sync_entries_to_google_sheet,
     sync_google_sheet_bidirectional,
 )
 from app.weekly_review import format_open_tasks_message, fetch_open_tasks, generate_and_store_weekly_review, get_existing_review_for_window, mark_task_done, remember_chat_id, review_matches_current_format, split_review_sections
-from app.daily_briefing import generate_and_store_daily_briefing
+from app.tasks_sheet_sync import sync_tasks_tab
+from app.ideas_sheet_sync import sync_ideas_tab
+from app.people_sheet_sync import sync_people_tab
+from app.projects_sheet_sync import sync_projects_tab
+from app.books_sheet_sync import sync_books_tab
+from app.highlights_sheet_sync import sync_highlights_tab
+from app.daily_briefing import due_date_emoji, generate_and_store_daily_briefing
 from app.job_runs import ensure_job_runs_table, get_recent_job_runs, mark_running_job_runs_failed_on_startup
 from app.llm_clients import answer_from_context, classify_intent
+from app.inline_keyboards import dispatch_callback
+from app.idea_to_task import create_task_from_idea, handle_idea_to_task_edit_reply, send_idea_to_task_draft, IdeaNotFound, WrongEntryType
+import app.new_person_flow
+from app.new_person_flow import handle_profile_text, handle_unresolved_who
 
 load_dotenv()
 cfg = get_config()
@@ -71,26 +82,20 @@ ASK_MIN_RELEVANCE = cfg.commands.ask.threshold
 ASK_FAIL_MESSAGE = cfg.commands.ask.fail_message
 SAVE_CONFIRMATION_TEXT = cfg.telegram.save_confirmation_text
 TAGGING_MODEL = "gpt-4o-mini"
-TYPE_CHOICES = ("highlight", "book", "person", "idea", "task")
+TYPE_CHOICES = ("highlight", "book", "person", "idea", "task", "project", "memory_note", "instructions")
 TOPIC_CHOICES = tuple(cfg.topics.vocabulary)
 TOPIC_CHOICES_TEXT = ", ".join(TOPIC_CHOICES)
-WHO_CHOICES = (
-    "Я", "Юля", "Даша", "Кирилл", "Варя", "Брат", "Мы", "Дети", "Друзья",
-    "Работа", "Книга", "Природа", "Здоровье",
-)
 TAGGING_SYSTEM_PROMPT = f"""Extract metadata for one journal entry. Return JSON only:
-{{"who":"...","title":"...","language":"...","type":"...","topic":"..."}}
+{{"who":"...","title":"...","language":"...","type":"...","topic":"...","summary_en":"..."}}
 
 Rules:
-- who must be one of: Я, Юля, Даша, Кирилл, Варя, Брат, Мы, Дети, Друзья, Работа, Книга, Природа, Здоровье.
-- If unclear, use Я.
-- who must always be in Russian.
-- Only choose a non-Я who when that person/category is explicitly present in the entry. Never guess family members from generic tasks.
-- For generic personal tasks with no named person/category, use Я.
-- title must be 2-4 words in the detected language of the entry. For English entries, title must be English even if the content mentions Russian words.
+- who is the name of the single person the entry is about, written or spoken to, or with. Use the most specific name available in the text: full names, first names, or familiar forms (for example, "Юля", "Marcin", "Аркадий Добкин").
+- If the entry is about the author themselves (first-person reflection, personal thought, no other person involved), return "Я".
+- If no specific person is named or implied, return null.
+- Do not return roles ("wife", "boss"), relationships ("brother"), groups ("team", "family"), topics ("work", "health"), events ("meeting"), or generic nouns. Return a person name or null, nothing else.
+- title must be 2-4 words in English, regardless of the entry language. Translate or summarize the entry content into a concise English title. The body/content stays in the original language — only the title is English.
 - language must be one of: ru, en, pl, de.
-- type must be one of: highlight, book, person, idea, task.
-
+- type must be one of: highlight, book, person, idea, task, project, memory_note, instructions.
 Topic rules — assign exactly one topic. The topic must come from this exact list: {TOPIC_CHOICES_TEXT}. Do not invent topics.
 
 Topic definitions:
@@ -104,6 +109,13 @@ Topic definitions:
 - ideas: open-ended thoughts, speculations, possibilities not tied to any of the above categories. Use this ONLY when the entry is a genuine abstract thought that doesn't fit a concrete domain. Do not use for project ideas (those go to openbrain or career).
 - admin: bureaucracy, documents, visas, insurance, appointments, equipment/tools setup (monitor, laptop, home office), cemetery/grave maintenance, household repairs.
 - other: use ONLY when no category above fits. Prefer a specific category over 'other' whenever any category plausibly fits.
+
+Summary rules — write summary_en as one sentence in English, max 200 characters, capturing the core fact, decision, or thought of the entry. Always English regardless of entry language. Do not start with "The entry says" or "This is" — write the substance directly. If the entry is one short fragment, the summary may be a near-translation. If the entry is long, distill the most important point in one line.
+
+Examples:
+- "купил монитор LG 27 для домашнего стола" -> "Bought an LG 27-inch monitor for the home desk."
+- "что если запустить курс по AI для нетехнических менеджеров" -> "Considering launching an AI course for non-technical managers."
+- "обсудить с Кириллом риски даунхила перед сезоном" -> "Need to talk to Кирилл about downhill risks before the season."
 
 Classification examples:
 - "OpenBrain: проверить topic field" -> openbrain
@@ -124,6 +136,8 @@ Type rules:
 - highlight = something that happened, a reflection, or a general observation.
 - book = primarily about a book or reading.
 - person = primarily about a person.
+- project = primarily about a concrete project, product, or ongoing build effort.
+- instructions = durable guidance, operating instructions, prompts, or rules for OpenBrain/Codex/Claude builders or system behavior.
 
 Be conservative:
 - false task positives are worse than false negatives.
@@ -164,18 +178,25 @@ Rules:
 - If the entry is mostly a journal highlight but includes one clear reusable idea, use embedded_idea.
 - The extracted text MUST be in the same language as the original entry.
 - The extracted text MUST include enough context to be understood on its own, without reading the original entry.
+- The user message includes a Reference date. Use it as today's date for resolving relative dates.
 - BAD: "Добавить визуалы" (wrong language, no context)
 - GOOD: "Add visuals to LinkedIn posts" (same language, clear context)
 - Keep the extracted text short, clear, and standalone.
-- If the due date is relative, resolve it from the reference date provided below.
+- Extract due_date ONLY when the task text explicitly mentions a date, weekday, deadline, reminder time, or relative date phrase.
+- If the due date is relative, resolve it from the Reference date into absolute YYYY-MM-DD.
 - If no reliable due date is stated, return null.
+- Do not guess a date and do not default to today.
 - Use due_date only for tasks, not ideas.
 
 Examples:
-- "Need to call Максим this week" -> explicit_task, "Need to call Максим this week"
-- "Надо записаться к стоматологу" -> explicit_task, "Записаться к стоматологу"
+- Reference date: 2026-05-11; "Need to call Максим this week" -> explicit_task, "Need to call Максим this week", null
+- Reference date: 2026-05-11; "Submit the proposal by Friday" -> explicit_task, "Submit the proposal by Friday", "2026-05-15"
+- Reference date: 2026-05-11; "Позвонить врачу к понедельнику" -> explicit_task, "Позвонить врачу к понедельнику", "2026-05-18"
+- Reference date: 2026-05-11; "Wysłać fakturę do piątku" -> explicit_task, "Wysłać fakturę do piątku", "2026-05-15"
+- Reference date: 2026-05-11; "Bericht bis Freitag fertig machen" -> explicit_task, "Bericht bis Freitag fertig machen", "2026-05-15"
+- "Надо записаться к стоматологу" -> explicit_task, "Записаться к стоматологу", null
 - "Had a great day, walked in the forest" -> none
-- "Met with LeverX. They want a proposal by Friday. Feeling good." -> embedded_task, "Prepare proposal for LeverX by Friday"
+- Reference date: 2026-05-11; "Met with LeverX. They want a proposal by Friday. Feeling good." -> embedded_task, "Prepare proposal for LeverX by Friday", "2026-05-15"
 - "Reflection: yesterday's LinkedIn post went well. Today I realized team photos would make it better." -> embedded_idea, "Add team photos to LinkedIn posts"
 - "Interesting idea about building a course" -> none
 - "I think I should change my approach" -> none"""
@@ -254,6 +275,22 @@ def truncate(text_value: str, limit: int = MAX_PROVIDER_OUTPUT_CHARS) -> str:
 
 def normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+TYPE_PREFIX_PATTERN = re.compile(
+    r"^(?:"
+    r"task|idea|highlight|note|project|book|person|memory|"
+    r"задача|идея|хайлайт|заметка|проект|книга|человек|память|"
+    r"zadanie|pomysł|cytat|notatka|projekt|książka|osoba|pamięć|"
+    r"aufgabe|idee|zitat|notiz|projekt|buch|person|erinnerung"
+    r"):\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_type_prefix(text: str) -> str:
+    """Strip a single leading type-tagging prefix (Task:, Idea:, Задача:, etc.). Whitespace after the colon is also consumed. If no prefix matches, return text unchanged."""
+    return TYPE_PREFIX_PATTERN.sub("", text, count=1)
 
 
 def parse_json_object_from_text(text_value: str) -> dict[str, Any]:
@@ -416,7 +453,24 @@ def extract_scoped_search_topic(user_text: str) -> str:
 
 def match_who_in_text(user_text: str) -> Optional[str]:
     normalized = normalize_whitespace(user_text).lower()
-    for who in sorted(WHO_CHOICES, key=len, reverse=True):
+    if not normalized:
+        return None
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text("SELECT canonical_name, aliases FROM entities")).mappings().all()
+    except Exception as exc:
+        logger.warning("Failed to load entities for who query matching: %s", exc)
+        return None
+
+    candidates: set[str] = set()
+    for row in rows:
+        if row.get("canonical_name"):
+            candidates.add(str(row["canonical_name"]))
+        for alias in row.get("aliases") or []:
+            if alias:
+                candidates.add(str(alias))
+
+    for who in sorted(candidates, key=len, reverse=True):
         pattern = rf"(?<!\w){re.escape(who.lower())}(?!\w)"
         if re.search(pattern, normalized, flags=re.IGNORECASE):
             return who
@@ -646,30 +700,6 @@ def infer_type_from_text(entry_text: str) -> str:
     return "highlight"
 
 
-def infer_who_from_text(entry_text: str) -> Optional[str]:
-    normalized = normalize_whitespace(entry_text).lower()
-    if re.search(r"(?<![а-яё])брат(а|у|ом|е)?(?![а-яё])|(?<![a-z])brother(?![a-z])", normalized):
-        return "Брат"
-
-    who_patterns = [
-        ("Юля", ["юля", "юле", "юли", "юлей", "julia"]),
-        ("Даша", ["даша", "dasha"]),
-        ("Кирилл", ["кирил", "kirill"]),
-        ("Варя", ["варя", "varia", "varya"]),
-        ("Брат", ["brother"]),
-        ("Дети", ["дети", "kids", "children"]),
-        ("Друзья", ["друз", "friends"]),
-        ("Мы", ["мы ", "we "] ),
-        ("Работа", ["leverx", "meeting", "client", "office", "работ", "praca", "arbeit"]),
-        ("Книга", ["книг", "book", "read", "reading", "lesen", "czyta"]),
-        ("Природа", ["лес", "forest", "nature", "природ", "walk", "spacer", "wald"]),
-        ("Здоровье", ["здоров", "doctor", "therapy", "health", "боле", "krank"]),
-    ]
-    for who_name, keywords in who_patterns:
-        if any(keyword in normalized for keyword in keywords):
-            return who_name
-    return None
-
 
 def extract_entry_metadata(
     entry_text: str,
@@ -678,11 +708,11 @@ def extract_entry_metadata(
     who_override: Optional[str] = None,
 ) -> dict[str, Optional[str]]:
     detected_language = detected_language_override or detect_language_bucket(entry_text)
-    inferred_who = who_override or infer_who_from_text(entry_text)
+    inferred_who = None
     inferred_type = forced_type or infer_type_from_text(entry_text)
-    fallback_who = inferred_who or "Я"
+    fallback_who = who_override or "Я"
     if not openai_client:
-        return {"who": fallback_who, "title": None, "language": detected_language, "type": inferred_type, "topic": None}
+        return {"who": fallback_who, "title": None, "language": detected_language, "type": inferred_type, "topic": None, "summary_en": None}
 
     try:
         response = openai_client.responses.create(
@@ -694,9 +724,12 @@ def extract_entry_metadata(
                     "content": f"Detected language: {detected_language}\nEntry:\n{entry_text}",
                 },
             ],
-            max_output_tokens=140,
+            max_output_tokens=220,
         )
         payload = parse_json_object_from_text(response.output_text or "{}")
+        summary_en = normalize_whitespace(str(payload.get("summary_en") or "")) or None
+        if summary_en and len(summary_en) > 200:
+            summary_en = summary_en[:200]
         who = normalize_whitespace(str(payload.get("who") or "")) or None
         title = normalize_whitespace(str(payload.get("title") or ""))
         language = normalize_whitespace(str(payload.get("language") or detected_language)).lower()
@@ -705,11 +738,8 @@ def extract_entry_metadata(
 
         if who_override:
             who = who_override
-        elif inferred_who:
-            # Deterministic keyword matches are safer than LLM guesses for this closed field.
+        elif inferred_who is not None:
             who = inferred_who
-        elif who not in WHO_CHOICES or who != "Я":
-            who = "Я"
 
         if title:
             title = " ".join(title.split()[:4])
@@ -729,10 +759,10 @@ def extract_entry_metadata(
         if topic not in TOPIC_CHOICES:
             topic = None
 
-        return {"who": who or fallback_who, "title": title, "language": language, "type": entry_type, "topic": topic}
+        return {"who": who, "title": title, "language": language, "type": entry_type, "topic": topic, "summary_en": summary_en}
     except Exception as exc:
         logger.warning("Metadata tagging failed; saving without metadata: %s", exc)
-        return {"who": fallback_who, "title": None, "language": detected_language, "type": inferred_type, "topic": None}
+        return {"who": fallback_who, "title": None, "language": detected_language, "type": inferred_type, "topic": None, "summary_en": None}
 
 
 def normalize_due_date(raw_value: Any) -> Optional[date]:
@@ -743,6 +773,14 @@ def normalize_due_date(raw_value: Any) -> Optional[date]:
         return date.fromisoformat(raw[:10])
     except ValueError:
         return None
+
+
+def normalize_due_date_from_llm(raw_value: Any, *, context: str) -> Optional[date]:
+    raw = normalize_whitespace(str(raw_value or ""))
+    due_date = normalize_due_date(raw)
+    if raw and raw.lower() != "null" and due_date is None:
+        logger.warning("%s returned invalid due_date %r; storing NULL", context, raw)
+    return due_date
 
 
 def format_readable_date(target_date: date) -> str:
@@ -769,7 +807,7 @@ def extract_reminder_signal(
         )
         payload = parse_json_object_from_text(response.output_text or "{}")
         has_date = bool(payload.get("has_date"))
-        due_date = normalize_due_date(payload.get("due_date"))
+        due_date = normalize_due_date_from_llm(payload.get("due_date"), context="Reminder date extraction")
         clean_content = normalize_whitespace(str(payload.get("clean_content") or "")) or entry_text
         if not has_date or due_date is None or due_date < current:
             return {"has_date": False, "due_date": None, "clean_content": entry_text}
@@ -814,7 +852,7 @@ def extract_task_signal(
         if decision not in {"none", "explicit_task", "embedded_task", "embedded_idea"}:
             decision = default_decision
         task_text = normalize_whitespace(str(payload.get("task_text") or "")) or None
-        due_date = normalize_due_date(payload.get("due_date"))
+        due_date = normalize_due_date_from_llm(payload.get("due_date"), context="Task extraction")
         reason = normalize_whitespace(str(payload.get("reason") or "")) or None
         if forced_type == "task" and decision == "none":
             decision = "explicit_task"
@@ -919,7 +957,7 @@ def create_extracted_task_entry(
         except Exception as exc:
             logger.warning("Embedding failed during extracted task save; saving without embedding: %s", exc)
 
-    tags = classify_tags(task_text)
+    tags = classify_tags(task_text, "task")
     entry_id = save_entry(
         task_text,
         embedding,
@@ -933,6 +971,7 @@ def create_extracted_task_entry(
         metadata.get("due_date"),
         parent_entry_id,
         metadata.get("topic"),
+        summary_en=metadata.get("summary_en"),
     )
     metadata["id"] = entry_id
     metadata["parent_entry_id"] = parent_entry_id
@@ -964,7 +1003,7 @@ def create_extracted_idea_entry(
         except Exception as exc:
             logger.warning("Embedding failed during extracted idea save; saving without embedding: %s", exc)
 
-    tags = classify_tags(idea_text)
+    tags = classify_tags(idea_text, "idea")
     entry_id = save_entry(
         idea_text,
         embedding,
@@ -978,13 +1017,17 @@ def create_extracted_idea_entry(
         None,
         parent_entry_id,
         metadata.get("topic"),
+        summary_en=metadata.get("summary_en"),
     )
     metadata["id"] = entry_id
     metadata["parent_entry_id"] = parent_entry_id
     return metadata
 
 
-def classify_tags(note_text: str) -> list[str]:
+def classify_tags(note_text: str, entry_type: Optional[str] = None) -> list[str]:
+    if (entry_type or "").strip().lower() == "instructions":
+        return ["Projects"]
+
     normalized = normalize_whitespace(note_text).lower()
     found: list[str] = []
     keyword_groups = [
@@ -1019,6 +1062,7 @@ def save_entry(
     due_date: Optional[date] = None,
     parent_entry_id: Optional[int] = None,
     topic: Optional[str] = None,
+    summary_en: Optional[str] = None,
 ) -> int:
     vector_literal = embedding_to_vector_literal(embedding) if embedding else None
     params = {
@@ -1034,14 +1078,17 @@ def save_entry(
         "due_date": due_date,
         "parent_entry_id": parent_entry_id,
         "topic": topic if topic in TOPIC_CHOICES else None,
+        "summary_en": summary_en,
     }
     with engine.begin() as conn:
+        params["who_ids"] = resolve_who_to_ids_safe(who, conn)
+        logger.debug("entity_resolve who=%r -> who_ids=%s", who, params["who_ids"])
         if vector_literal:
             row = conn.execute(
                 text(
                     """
-                    INSERT INTO entries (content, embedding, tags, who, title, language, type, topic, status, source, due_date, parent_entry_id)
-                    VALUES (:content, CAST(:embedding AS vector), :tags, :who, :title, :language, :entry_type, :topic, :status, :source, :due_date, :parent_entry_id)
+                    INSERT INTO entries (content, embedding, tags, who, who_ids, title, language, type, topic, status, source, due_date, parent_entry_id, summary_en)
+                    VALUES (:content, CAST(:embedding AS vector), :tags, :who, :who_ids, :title, :language, :entry_type, :topic, :status, :source, :due_date, :parent_entry_id, :summary_en)
                     RETURNING id
                     """
                 ),
@@ -1051,8 +1098,8 @@ def save_entry(
             row = conn.execute(
                 text(
                     """
-                    INSERT INTO entries (content, tags, who, title, language, type, topic, status, source, due_date, parent_entry_id)
-                    VALUES (:content, :tags, :who, :title, :language, :entry_type, :topic, :status, :source, :due_date, :parent_entry_id)
+                    INSERT INTO entries (content, tags, who, who_ids, title, language, type, topic, status, source, due_date, parent_entry_id, summary_en)
+                    VALUES (:content, :tags, :who, :who_ids, :title, :language, :entry_type, :topic, :status, :source, :due_date, :parent_entry_id, :summary_en)
                     RETURNING id
                     """
                 ),
@@ -1078,6 +1125,7 @@ def update_entry(
     status: Optional[str] = None,
     due_date: Optional[date] = None,
     topic: Optional[str] = None,
+    summary_en: Optional[str] = None,
 ) -> bool:
     vector_literal = embedding_to_vector_literal(embedding) if embedding else None
     params = {
@@ -1092,6 +1140,7 @@ def update_entry(
         "status": status,
         "due_date": due_date,
         "topic": topic if topic in TOPIC_CHOICES else None,
+        "summary_en": summary_en,
     }
     with engine.begin() as conn:
         exists = conn.execute(
@@ -1100,6 +1149,8 @@ def update_entry(
         ).scalar()
         if not exists:
             return False
+        params["who_ids"] = resolve_who_to_ids_safe(who, conn)
+        logger.debug("entity_resolve who=%r -> who_ids=%s", who, params["who_ids"])
         if vector_literal:
             conn.execute(
                 text(
@@ -1109,12 +1160,14 @@ def update_entry(
                         embedding = CAST(:embedding AS vector),
                         tags = :tags,
                         who = :who,
+                        who_ids = :who_ids,
                         title = :title,
                         language = :language,
                         type = :entry_type,
                         topic = :topic,
                         status = :status,
-                        due_date = :due_date
+                        due_date = :due_date,
+                        summary_en = :summary_en
                     WHERE id = :entry_id
                     """
                 ),
@@ -1129,12 +1182,14 @@ def update_entry(
                         embedding = NULL,
                         tags = :tags,
                         who = :who,
+                        who_ids = :who_ids,
                         title = :title,
                         language = :language,
                         type = :entry_type,
                         topic = :topic,
                         status = :status,
-                        due_date = :due_date
+                        due_date = :due_date,
+                        summary_en = :summary_en
                     WHERE id = :entry_id
                     """
                 ),
@@ -1177,7 +1232,7 @@ def search_entries(query_embedding: list[float], top_k: int, tag: Optional[str] 
 
 def fetch_entries_by_type(entry_type: str, status: Optional[str] = None) -> list[dict[str, Any]]:
     sql = """
-        SELECT id, created_at, type, who, title, content, status
+        SELECT id, created_at, type, who, title, content, status, due_date, priority
         FROM entries
         WHERE type = :entry_type
     """
@@ -1189,6 +1244,42 @@ def fetch_entries_by_type(entry_type: str, status: Optional[str] = None) -> list
 
     with engine.begin() as conn:
         rows = conn.execute(text(sql), params).mappings().all()
+        return [dict(r) for r in rows]
+
+
+def fetch_open_ideas_with_task_counts() -> list[dict[str, Any]]:
+    """Fetch ideas with status NOT IN ('done', 'archived'), with spawned task
+    counts and IDs from entry_relations. Sorted by priority DESC NULLS LAST,
+    then created_at DESC."""
+    sql = """
+        SELECT
+            i.id,
+            i.created_at,
+            i.type,
+            i.who,
+            i.title,
+            i.content,
+            i.status,
+            i.priority,
+            COALESCE(
+                (
+                    SELECT array_agg(er.from_entry_id ORDER BY er.from_entry_id)
+                    FROM entry_relations er
+                    JOIN entries t ON t.id = er.from_entry_id
+                    WHERE er.to_entry_id = i.id
+                      AND er.relation_type = 'spawned_from'
+                      AND t.type = 'task'
+                      AND (t.status IS NULL OR t.status NOT IN ('done', 'archived'))
+                ),
+                ARRAY[]::bigint[]
+            ) AS spawned_task_ids
+        FROM entries i
+        WHERE i.type = 'idea'
+          AND (i.status IS NULL OR i.status NOT IN ('done', 'archived'))
+        ORDER BY i.priority DESC NULLS LAST, i.created_at DESC, i.id DESC
+    """
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql)).mappings().all()
         return [dict(r) for r in rows]
 
 
@@ -1223,8 +1314,8 @@ def build_entry_detail_message(entry: dict[str, Any]) -> str:
     return (
         f"📄 Entry #{entry['id']}\n"
         f"Date: {date_text}\n"
-        f"Type: {entry.get('type') or '-'} | Status: {status_text}\n"
-        f"Who: {entry.get('who') or '-'} | Language: {entry.get('language') or '-'}\n"
+        f"Status: {status_text}\n"
+        f"Who: {entry.get('who') or '-'}\n"
         f"Title: {title_text}{parent_text}\n\n"
         f"{entry.get('content') or ''}"
     )
@@ -1505,6 +1596,46 @@ def build_entry_list_message(entries: list[dict[str, Any]], header: str, show_ag
     return "\n".join(lines)
 
 
+def build_tasks_message(entries: list[dict[str, Any]]) -> str:
+    today = datetime.now(timezone.utc).date()
+    sorted_entries = sorted(
+        entries,
+        key=lambda entry: (
+            entry.get("due_date") is None,
+            entry.get("due_date") or date.max,
+            int(entry["id"]),
+        ),
+    )
+
+    lines = [f"📋 Open tasks ({len(sorted_entries)}):", ""]
+    for idx, entry in enumerate(sorted_entries, start=1):
+        emoji_or_space = due_date_emoji(entry.get("due_date"), today) or " "
+        content_full = (entry.get("content") or "").strip()
+        if not content_full:
+            content_full = (entry.get("title") or "").strip() or "(no content)"
+        lines.append(f"{emoji_or_space} {idx}. {content_full} (#{entry['id']})")
+    return "\n".join(lines)
+
+
+def build_ideas_message(entries: list[dict[str, Any]]) -> str:
+    if not entries:
+        return "💡 Ideas (0):"
+    lines = [f"💡 Ideas ({len(entries)}):", ""]
+    for idx, entry in enumerate(entries, start=1):
+        raw_content = (entry.get("content") or "").strip()
+        if raw_content:
+            content = raw_content if len(raw_content) <= 100 else raw_content[:100].rstrip() + "…"
+        else:
+            content = (entry.get("title") or "(no content)").strip()
+        spawned = entry.get("spawned_task_ids") or []
+        task_suffix = ""
+        if spawned:
+            ids_str = ", ".join(f"#{tid}" for tid in spawned)
+            task_suffix = f" ({len(spawned)} tasks: {ids_str})" if len(spawned) > 1 else f" (1 task: {ids_str})"
+        lines.append(f"{idx}. {content}{task_suffix} (#{entry['id']})")
+    return "\n".join(lines)
+
+
 def get_tag_counts() -> list[tuple[str, int]]:
     with engine.begin() as conn:
         rows = conn.execute(
@@ -1720,6 +1851,31 @@ async def run_blocking(func: Callable, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+
+def fetch_entry_person_state(entry_id: int) -> dict[str, Any] | None:
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT who, who_ids FROM entries WHERE id = :id"),
+            {"id": entry_id},
+        ).mappings().first()
+    return dict(row) if row else None
+
+
+async def maybe_start_new_person_flow(entry_id: int, chat_id: int | None, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if chat_id is None:
+        return
+    try:
+        row = await run_blocking(fetch_entry_person_state, entry_id)
+        if not row:
+            return
+        who = normalize_whitespace(str(row.get("who") or ""))
+        who_ids = row.get("who_ids") or []
+        if who and not who_ids:
+            await handle_unresolved_who(entry_id, who, chat_id, context)
+    except Exception:
+        logger.exception("Failed to start new-person flow for entry #%s", entry_id)
+
+
 def contains_cyrillic(text_value: str) -> bool:
     return bool(re.search(r"[а-яА-ЯёЁ]", text_value or ""))
 
@@ -1785,6 +1941,7 @@ async def process_captured_content(
     transcript_text: Optional[str] = None,
     detected_language: Optional[str] = None,
     who_override: Optional[str] = None,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
     original_content = content
     reminder_signal = await run_blocking(extract_reminder_signal, original_content)
@@ -1855,7 +2012,7 @@ async def process_captured_content(
                 except Exception as exc:
                     logger.warning("Embedding failed during question capture; saving without embedding: %s", exc)
 
-            tags = await run_blocking(classify_tags, content)
+            tags = await run_blocking(classify_tags, content, metadata.get("type"))
             status = "open" if metadata.get("type") == "task" else None
             final_due_date = reminder_due_date or metadata.get("due_date")
             entry_id = await run_blocking(
@@ -1870,7 +2027,11 @@ async def process_captured_content(
                 status,
                 source,
                 final_due_date,
+                summary_en=metadata.get("summary_en"),
             )
+
+            if context is not None and intent != "question":
+                asyncio.create_task(maybe_start_new_person_flow(entry_id, update.effective_chat.id if update.effective_chat else None, context))
 
             suffix = f"✓ Saved (#{entry_id})"
             if final_due_date:
@@ -1900,12 +2061,13 @@ async def process_captured_content(
             except Exception as exc:
                 logger.warning("Embedding failed during capture; saving without embedding: %s", exc)
 
-        tags = await run_blocking(classify_tags, content)
+        tags = await run_blocking(classify_tags, content, metadata.get("type"))
         status = "open" if metadata.get("type") == "task" else None
         final_due_date = reminder_due_date or metadata.get("due_date")
+        content_to_save = strip_type_prefix(content)
         entry_id = await run_blocking(
             save_entry,
-            content,
+            content_to_save,
             embedding,
             tags,
             metadata.get("who"),
@@ -1917,7 +2079,11 @@ async def process_captured_content(
             final_due_date,
             None,
             metadata.get("topic"),
+            summary_en=metadata.get("summary_en"),
         )
+
+        if context is not None:
+            asyncio.create_task(maybe_start_new_person_flow(entry_id, update.effective_chat.id if update.effective_chat else None, context))
 
         extra_message = None
         if extra_item and extra_item.get("content"):
@@ -1999,6 +2165,7 @@ async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             source="voice",
             transcript_text=transcript_text,
             detected_language=transcript_language,
+            context=context,
         )
     except Exception as exc:
         logger.exception("Voice capture failed")
@@ -2209,7 +2376,7 @@ async def forced_type_save_handler(update: Update, context: ContextTypes.DEFAULT
             except Exception as exc:
                 logger.warning("Embedding failed during forced-type capture; saving without embedding: %s", exc)
 
-        tags = await run_blocking(classify_tags, content)
+        tags = await run_blocking(classify_tags, content, forced_type)
         status = "open" if forced_type == "task" else None
         entry_id = await run_blocking(
             save_entry,
@@ -2223,6 +2390,7 @@ async def forced_type_save_handler(update: Update, context: ContextTypes.DEFAULT
             status,
             "telegram",
             metadata.get("due_date"),
+            summary_en=metadata.get("summary_en"),
         )
         await reply_text(update, f"✓ Saved (#{entry_id}) | Who: {metadata.get('who') or 'Я'} | Type: {forced_type}")
     except Exception as exc:
@@ -2235,8 +2403,124 @@ async def book_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await forced_type_save_handler(update, context, "task")
+    await send_typing(update)
+    message = update.effective_message
+    if message is None:
+        return
 
+    args = context.args or []
+
+    # Path 1: /task <idea_id> [text]
+    if args and args[0].isdigit():
+        idea_id = int(args[0])
+        title = " ".join(args[1:]).strip()
+        if not title:
+            await send_idea_to_task_draft(update, context, idea_id)
+            return
+        try:
+            result = await run_blocking(create_task_from_idea, idea_id, title, "telegram")
+        except IdeaNotFound:
+            await reply_text(update, f"No idea with id {idea_id}.")
+            return
+        except WrongEntryType as e:
+            await reply_text(update, str(e))
+            return
+        except ValueError as e:
+            await reply_text(update, str(e))
+            return
+        except Exception as exc:
+            logger.exception("/task linked creation failed")
+            await reply_text(update, f"Failed: {exc}")
+            return
+        topic_str = f" · topic={result['topic']}" if result.get("topic") else ""
+        who_str = f" · who={result['who']}" if result.get("who") else ""
+        await reply_text(
+            update,
+            f"Task #{result['task_id']} created from idea #{result['idea_id']}{topic_str}{who_str}",
+        )
+        return
+
+    # Path 2: reply-to-idea uses a heuristic because original Telegram message_id
+    # is not stored yet; if no matching idea is found, legacy task capture runs.
+    if message.reply_to_message is not None:
+        reply_text_value = message.reply_to_message.text or message.reply_to_message.caption or ""
+        title = " ".join(args).strip()
+        with engine.begin() as conn:
+            idea_row = conn.execute(
+                text("""
+                    SELECT id FROM entries
+                    WHERE type = 'idea'
+                      AND (title = :t OR content = :t OR content LIKE :like)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """),
+                {"t": reply_text_value.strip(), "like": f"%{reply_text_value.strip()[:80]}%"},
+            ).mappings().first()
+        if idea_row:
+            idea_id = int(idea_row["id"])
+            if not title:
+                await send_idea_to_task_draft(update, context, idea_id)
+                return
+            try:
+                result = await run_blocking(create_task_from_idea, idea_id, title, "telegram-reply")
+            except Exception as exc:
+                logger.exception("/task reply-to creation failed")
+                await reply_text(update, f"Failed: {exc}")
+                return
+            await reply_text(
+                update,
+                f"Task #{result['task_id']} created from idea #{result['idea_id']} (matched via reply)",
+            )
+            return
+
+    # Path 3: legacy behavior — capture this message as a standalone task
+    await forced_type_save_handler(update, context, forced_type="task")
+
+
+async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update)
+    message = update.effective_message
+    if message is None:
+        return
+
+    args = context.args or []
+    if len(args) != 3 or not args[0].isdigit() or not args[2].isdigit():
+        await reply_text(update, "Usage: /link <from_id> <relation_type> <to_id>")
+        return
+
+    from_id = int(args[0])
+    relation_type = args[1]
+    to_id = int(args[2])
+
+    from app.entry_relations import (
+        create_relation,
+        InvalidRelationType,
+        EntryNotFound,
+        RelationExists,
+        VALID_RELATION_TYPES,
+    )
+
+    try:
+        new_id = await run_blocking(create_relation, from_id, to_id, relation_type)
+    except InvalidRelationType:
+        vocab = ", ".join(sorted(VALID_RELATION_TYPES))
+        await reply_text(update, f"Unknown relation type '{relation_type}'. Valid: {vocab}")
+        return
+    except ValueError as e:
+        await reply_text(update, str(e))
+        return
+    except EntryNotFound as e:
+        await reply_text(update, f"Entry {e.missing_id} not found")
+        return
+    except RelationExists:
+        await reply_text(update, "Link already exists")
+        return
+    except Exception as exc:
+        logger.exception("/link failed")
+        await reply_text(update, f"Failed: {exc}")
+        return
+
+    await reply_text(update, f"Linked: {from_id} {relation_type} {to_id} ✓ (edge #{new_id})")
 
 async def idea_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await forced_type_save_handler(update, context, "idea")
@@ -2264,7 +2548,7 @@ async def edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 embedding = await run_blocking(get_openai_embedding, new_content)
             except Exception as exc:
                 logger.warning("Embedding failed during edit; saving without embedding: %s", exc)
-        tags = await run_blocking(classify_tags, new_content)
+        tags = await run_blocking(classify_tags, new_content, metadata.get("type"))
         status = "open" if metadata.get("type") == "task" else None
         updated = await run_blocking(
             update_entry,
@@ -2279,6 +2563,7 @@ async def edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             status,
             metadata.get("due_date"),
             metadata.get("topic"),
+            metadata.get("summary_en"),
         )
         if not updated:
             await reply_text(update, "Entry not found")
@@ -2290,14 +2575,44 @@ async def edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply_text(update, f"/edit failed: {exc}")
 
 
-async def pull_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def regen_summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await reply_text(update, "Usage: /regen_summary <entry_id>")
+        return
+
+    entry_id = int(args[0])
     await send_typing(update)
     try:
-        pulled_count = await run_blocking(pull_sheet_updates_to_database)
-        await reply_text(update, f"Pulled {pulled_count} updated entries from Google Sheets.")
+        entry = await run_blocking(fetch_entry_by_id, entry_id)
+        if not entry:
+            await reply_text(update, f"Entry #{entry_id} not found.")
+            return
+        if entry.get("type") in ("briefing", "review"):
+            await reply_text(update, "Skipping — briefings and reviews don't get summaries.")
+            return
+
+        metadata = await run_blocking(
+            extract_entry_metadata,
+            entry.get("content") or "",
+            entry.get("type"),
+            entry.get("language"),
+            entry.get("who"),
+        )
+        new_summary = metadata.get("summary_en")
+        if not new_summary:
+            await reply_text(update, "Failed: no summary generated (LLM call failed or empty).")
+            return
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE entries SET summary_en = :new_summary WHERE id = :entry_id"),
+                {"new_summary": new_summary, "entry_id": entry_id},
+            )
+        await reply_text(update, f"Updated #{entry_id}: {new_summary}")
     except Exception as exc:
-        logger.exception("/pull failed")
-        await reply_text(update, f"Pull failed: {exc}")
+        logger.exception("/regen_summary failed")
+        await reply_text(update, f"Failed: {exc.__class__.__name__}")
 
 
 async def sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2316,6 +2631,42 @@ async def sync_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.exception("/sync failed")
         await reply_text(update, f"Sync failed: {exc}")
 
+
+async def sync_tabs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_typing(update)
+    lines: list[str] = []
+
+    def format_line(label: str, result: object, *, include_pushed: bool = False) -> str:
+        conflicts = list(getattr(result, "conflicts", []) or [])
+        suffix = ""
+        if conflicts:
+            suffix = ": " + ", ".join(f"#{row_id}" for row_id in conflicts[:10])
+        line = (
+            f"{label}: {getattr(result, 'updated', getattr(result, 'pulled_updated', 0))} updated, "
+            f"{getattr(result, 'skipped', getattr(result, 'pulled_skipped', 0))} skipped, "
+            f"{len(conflicts)} conflicts{suffix}"
+        )
+        if include_pushed:
+            line += f", {getattr(result, 'pushed', 0)} pushed"
+        return line
+
+    for label, sync_func, include_pushed in (
+        ("Tasks", sync_tasks_tab, False),
+        ("Ideas", sync_ideas_tab, False),
+        ("People", sync_people_tab, False),
+        ("Projects", sync_projects_tab, False),
+        ("Books", sync_books_tab, False),
+        ("Highlights", sync_highlights_tab, False),
+        ("General", sync_google_sheet_bidirectional, True),
+    ):
+        try:
+            result = await run_blocking(sync_func)
+            lines.append(format_line(label, result, include_pushed=include_pushed))
+        except Exception as exc:
+            logger.exception("/sync %s tab failed", label)
+            lines.append(f"{label}: ERROR — {exc}")
+
+    await reply_text(update, "\n".join(lines))
 
 async def sheet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not GOOGLE_SHEET_URL:
@@ -2357,7 +2708,7 @@ async def tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not entries:
             await reply_text(update, "✅ No open tasks!")
             return
-        await reply_text(update, build_entry_list_message(entries, "📋 Open tasks", True))
+        await reply_text(update, build_tasks_message(entries))
     except Exception as exc:
         logger.exception("/tasks failed")
         await reply_text(update, f"/tasks failed: {exc}")
@@ -2518,12 +2869,8 @@ async def show_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def ideas_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_typing(update)
     try:
-        entries = await run_blocking(fetch_entries_by_type, "idea")
-        entries = [entry for entry in entries if entry.get("status") != "done"]
-        if not entries:
-            await reply_text(update, "💡 Ideas (0):")
-            return
-        await reply_text(update, build_entry_list_message(entries, "💡 Ideas", False))
+        entries = await run_blocking(fetch_open_ideas_with_task_counts)
+        await reply_text(update, build_ideas_message(entries))
     except Exception as exc:
         logger.exception("/ideas failed")
         await reply_text(update, f"/ideas failed: {exc}")
@@ -2592,6 +2939,10 @@ async def done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply_text(update, f"/done failed: {exc}")
 
 
+async def triage_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply_text(update, "Logged. Cycle complete.")
+
+
 async def handle_reply_edit(update: Update, reply_text_value: str, entry_id: int) -> bool:
     original_entry = await run_blocking(fetch_entry_by_id, entry_id)
     if not original_entry:
@@ -2612,7 +2963,7 @@ async def handle_reply_edit(update: Update, reply_text_value: str, entry_id: int
                     embedding = await run_blocking(get_openai_embedding, new_content)
                 except Exception as exc:
                     logger.warning("Embedding failed during reply edit; saving without embedding: %s", exc)
-            tags = await run_blocking(classify_tags, new_content)
+            tags = await run_blocking(classify_tags, new_content, metadata.get("type"))
             status = "open" if metadata.get("type") == "task" else None
             updated = await run_blocking(
                 update_entry,
@@ -2627,6 +2978,7 @@ async def handle_reply_edit(update: Update, reply_text_value: str, entry_id: int
                 status,
                 metadata.get("due_date"),
                 metadata.get("topic"),
+                metadata.get("summary_en"),
             )
             if not updated:
                 await reply_text(update, "Entry not found")
@@ -2642,7 +2994,7 @@ async def handle_reply_edit(update: Update, reply_text_value: str, entry_id: int
                 embedding = await run_blocking(get_openai_embedding, corrected_content)
             except Exception as exc:
                 logger.warning("Embedding failed during reply correction; saving without embedding: %s", exc)
-        tags = await run_blocking(classify_tags, corrected_content)
+        tags = await run_blocking(classify_tags, corrected_content, metadata.get("type"))
         status = "open" if metadata.get("type") == "task" else None
         updated = await run_blocking(
             update_entry,
@@ -2657,6 +3009,7 @@ async def handle_reply_edit(update: Update, reply_text_value: str, entry_id: int
             status,
             metadata.get("due_date"),
             metadata.get("topic"),
+            metadata.get("summary_en"),
         )
         if not updated:
             await reply_text(update, "Entry not found")
@@ -2671,6 +3024,12 @@ async def handle_reply_edit(update: Update, reply_text_value: str, entry_id: int
 
 async def capture_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
+        return
+
+    if await handle_profile_text(update, context):
+        return
+
+    if await handle_idea_to_task_edit_reply(update, context):
         return
 
     if not cfg.telegram.silent_capture_default:
@@ -2749,7 +3108,7 @@ async def capture_message_handler(update: Update, context: ContextTypes.DEFAULT_
         content = f"📨 Forwarded from {forwarded_sender}:\n{content}"
 
     await send_typing(update)
-    await process_captured_content(update, content, source="telegram", who_override=forwarded_sender)
+    await process_captured_content(update, content, source="telegram", who_override=forwarded_sender, context=context)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2780,15 +3139,18 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("ideas", ideas_handler))
     app.add_handler(CommandHandler("book", book_handler))
     app.add_handler(CommandHandler("task", task_handler))
+    app.add_handler(CommandHandler("link", link_handler))
     app.add_handler(CommandHandler("idea", idea_handler))
     app.add_handler(CommandHandler("person", person_handler))
     app.add_handler(CommandHandler("edit", edit_handler))
-    app.add_handler(CommandHandler("pull", pull_handler))
-    app.add_handler(CommandHandler("sync", sync_handler))
+    app.add_handler(CommandHandler("sync", sync_tabs_handler))
     app.add_handler(CommandHandler("sheet", sheet_handler))
     app.add_handler(CommandHandler("review", review_handler))
     app.add_handler(CommandHandler("briefing", briefing_handler))
     app.add_handler(CommandHandler("done", done_handler))
+    app.add_handler(CommandHandler("triage_done", triage_done_handler))
+    app.add_handler(CommandHandler("regen_summary", regen_summary_handler))
+    app.add_handler(CallbackQueryHandler(dispatch_callback))
     app.add_handler(MessageHandler(filters.VOICE, voice_message_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_message_handler))
 

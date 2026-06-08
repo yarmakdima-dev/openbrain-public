@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, text
 from telegram import Bot
 
 from app.config import get_config
+from app.entity_resolver import resolve_who_to_ids_safe
 from app.job_runs import track_job
 
 load_dotenv()
@@ -34,25 +35,24 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID_FILE = Path('/home/ubuntu/openbrain_starter/logs/last_chat_id.txt')
 BRIEFING_MODEL = "gpt-4o-mini"
 BRIEFING_TITLE_TEMPLATE = "Morning Briefing {date}"
+MONDAY_TRIAGE_LINE = "📋 Dispatch triage today — open Cowork → ~/Documents/Claude/OpenBrain/dispatch/ → 'run weekly triage'. Reply /triage_done when complete."
 
 BRIEFING_SYSTEM_PROMPT = """You create a short daily morning briefing from a personal journal and task list.
 
 Return JSON only with this exact schema:
 {
-  "selected_tasks": [
-    {"id": 123, "urgency": "high", "reason": "One short sentence"}
+  "dated_callouts": [
+    {"id": 123, "reason": "One short sentence"}
   ],
-  "opening_nudge": "One short sentence"
+  "undated_callout": {"id": 456, "reason": "One short sentence"} | null
 }
 
 Rules:
-- You may ONLY select IDs that appear in the OPEN TASKS block.
+- Pick up to 3 IDs from DUE TASKS, prioritizing overdue > yesterday > today > tomorrow.
+- Pick up to 1 ID from UNDATED OPEN TASKS, or null if none worth surfacing.
+- You may ONLY select IDs that appear in DUE TASKS or UNDATED OPEN TASKS.
 - Never reference any item from YESTERDAY'S CONTEXT or FRESH IDEAS as a task. Those sections are background context for tone only.
-- Select at most 5 tasks.
-- Prioritize by due date, age, and importance.
-- "reason" must explain why today. It must NOT restate the task title.
-- Keep each reason short, maximum 12 words.
-- Keep opening_nudge short, maximum 15 words.
+- "reason" must explain why this matters now, not restate the title. Max 12 words.
 - Return valid JSON only. No prose, no markdown, no commentary outside JSON."""
 
 engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
@@ -99,6 +99,23 @@ def fetch_open_tasks() -> list[dict[str, Any]]:
         ORDER BY CASE WHEN due_date IS NULL THEN 1 ELSE 0 END, due_date ASC, created_at ASC, id ASC
         """,
         {"today": current},
+    )
+
+
+def fetch_due_tasks(now: Optional[datetime] = None) -> list[dict[str, Any]]:
+    current = _current_time(now).date()
+    tomorrow = current + timedelta(days=1)
+    return _fetch_rows(
+        """
+        SELECT id, created_at, updated_at, content, title, type, status, due_date
+        FROM entries
+        WHERE type = 'task'
+          AND status = 'open'
+          AND due_date IS NOT NULL
+          AND due_date <= :tomorrow
+        ORDER BY due_date ASC, created_at ASC, id ASC
+        """,
+        {"tomorrow": tomorrow},
     )
 
 
@@ -160,11 +177,75 @@ def _due_label(task: dict[str, Any], now: Optional[datetime] = None) -> str:
     return f'due {due_date.isoformat()}'
 
 
-def build_briefing_prompt(open_tasks: list[dict[str, Any]], yesterday_entries: list[dict[str, Any]], fresh_ideas: list[dict[str, Any]], now: Optional[datetime] = None) -> str:
+def _due_bucket_label(due_date: Optional[date], current_date: date) -> str:
+    if due_date is None:
+        return "undated"
+    delta = (due_date - current_date).days
+    if delta <= -2:
+        return "overdue"
+    if delta == -1:
+        return "yesterday"
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    return "later"
+
+
+def due_date_emoji(due_date: Optional[date], current_date: date) -> str:
+    """Return the dot emoji for a task's due_date relative to current_date.
+    Returns empty string for undated, later (>1 day out), or far future."""
+    if due_date is None:
+        return ""
+    delta = (due_date - current_date).days
+    if delta <= -2:
+        return "🔴"
+    if delta == -1:
+        return "🟡"
+    if delta == 0:
+        return "🟢"
+    if delta == 1:
+        return "🔵"
+    return ""
+
+
+def _render_due_section(due_tasks: list[dict[str, Any]], now: Optional[datetime] = None) -> list[str]:
+    if not due_tasks:
+        return []
+
+    current = _current_time(now).date()
+    yesterday = current - timedelta(days=1)
+    tomorrow = current + timedelta(days=1)
+    buckets = [
+        ("🔴", "overdue", sum(1 for task in due_tasks if task.get("due_date") and task["due_date"] < yesterday)),
+        ("🟡", "yesterday", sum(1 for task in due_tasks if task.get("due_date") == yesterday)),
+        ("🟢", "today", sum(1 for task in due_tasks if task.get("due_date") == current)),
+        ("🔵", "tomorrow", sum(1 for task in due_tasks if task.get("due_date") == tomorrow)),
+    ]
+    parts = [f"{emoji} {count} {label}" for emoji, label, count in buckets if count]
+    if not parts:
+        return []
+
+    return ["Due", "• " + "  • ".join(parts)]
+
+
+def build_briefing_prompt(
+    open_tasks: list[dict[str, Any]],
+    due_tasks: list[dict[str, Any]],
+    yesterday_entries: list[dict[str, Any]],
+    fresh_ideas: list[dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> str:
     today_label = _date_label(now)
-    open_tasks_block = "\n".join(
-        f"[#{task['id']}] [{task['created_at'].astimezone(APP_TZ).strftime('%Y-%m-%d')}] ({_days_open(task['created_at'], now)} days open, {_due_label(task, now)}) {_task_label(task)}"
+    current_date = _current_time(now).date()
+    due_tasks_block = "\n".join(
+        f"[#{task['id']}] [{_due_bucket_label(task.get('due_date'), current_date)}] [{task['created_at'].astimezone(APP_TZ).strftime('%Y-%m-%d')}] ({_days_open(task['created_at'], now)} days open, {_due_label(task, now)}) {_task_label(task)}"
+        for task in due_tasks
+    ) or "(none)"
+    undated_open_tasks_block = "\n".join(
+        f"[#{task['id']}] [{task['created_at'].astimezone(APP_TZ).strftime('%Y-%m-%d')}] ({_days_open(task['created_at'], now)} days open) {_task_label(task)}"
         for task in open_tasks
+        if task.get("due_date") is None
     ) or "(none)"
     yesterday_block = "\n".join(
         f"[{entry['created_at'].astimezone(APP_TZ).strftime('%Y-%m-%d %H:%M')}] [{entry.get('type')}] [{entry.get('who') or '-'}] {_normalize_whitespace(entry.get('content') or '')[:220]}"
@@ -177,8 +258,11 @@ def build_briefing_prompt(open_tasks: list[dict[str, Any]], yesterday_entries: l
     return f"""TODAY:
 {today_label}
 
-OPEN TASKS:
-{open_tasks_block}
+DUE TASKS:
+{due_tasks_block}
+
+UNDATED OPEN TASKS:
+{undated_open_tasks_block}
 
 YESTERDAY'S CONTEXT (background only — DO NOT reference these as tasks):
 {yesterday_block}
@@ -215,7 +299,7 @@ def _briefing_task_lines_have_ids(briefing_text: str) -> bool:
     task_lines = []
     for line in (briefing_text or "").splitlines():
         stripped = line.strip()
-        if stripped.startswith(("🔴", "🟡", "⚪")):
+        if stripped.startswith(("🔴", "🟡", "🟢", "🔵", "⚪")):
             task_lines.append(stripped)
     if not task_lines:
         return False
@@ -236,25 +320,50 @@ def _urgency_emoji(urgency: str) -> str:
     return {"high": "🔴", "medium": "🟡", "low": "⚪"}.get(normalized, "⚪")
 
 
+def _due_bucket_emoji(due_date, current_date) -> str:
+    if due_date is None:
+        return "⚪"
+    delta = (due_date - current_date).days
+    if delta <= -2:
+        return "🔴"
+    if delta == -1:
+        return "🟡"
+    if delta == 0:
+        return "🟢"
+    if delta == 1:
+        return "🔵"
+    return "⚪"
+
+
 def _render_structured_briefing(
     payload: dict[str, Any],
     open_tasks: list[dict[str, Any]],
+    due_tasks: list[dict[str, Any]],
     now: Optional[datetime] = None,
 ) -> str:
     current = _current_time(now)
     lines = [f"🌅 {current.strftime('%B %-d, %A')}", ""]
+    if current.weekday() == 0:
+        lines.append(MONDAY_TRIAGE_LINE)
+        lines.append("")
     if current.weekday() >= 5:
         lines.append("It's the weekend — only tackle these if you feel like it.")
         lines.append("")
 
-    task_lookup = {int(task["id"]): task for task in open_tasks}
-    selected_tasks = payload.get("selected_tasks")
-    if not isinstance(selected_tasks, list):
-        raise RuntimeError("selected_tasks must be a list")
+    due_lines = _render_due_section(due_tasks, current)
+    if due_lines:
+        lines.extend(due_lines)
+        lines.append("")
+
+    due_lookup = {int(task["id"]): task for task in due_tasks}
+    undated_lookup = {int(task["id"]): task for task in open_tasks if task.get("due_date") is None}
+    dated_callouts = payload.get("dated_callouts")
+    if not isinstance(dated_callouts, list):
+        raise RuntimeError("dated_callouts must be a list")
 
     rendered_count = 0
     seen_ids: set[int] = set()
-    for item in selected_tasks[:5]:
+    for item in dated_callouts[:3]:
         if not isinstance(item, dict):
             continue
         task_id_raw = item.get("id")
@@ -265,44 +374,62 @@ def _render_structured_briefing(
             continue
         if task_id in seen_ids:
             continue
-        task = task_lookup.get(task_id)
+        task = due_lookup.get(task_id)
         if not task:
-            logger.warning("Briefing selected task id not in open_tasks: %s", task_id)
+            logger.warning("Briefing selected dated task id not in due_tasks: %s", task_id)
             continue
         seen_ids.add(task_id)
         reason = _normalize_whitespace(str(item.get("reason") or ""))
         if not reason:
             raise RuntimeError(f"Briefing reason missing for task #{task_id}")
-        lines.append(f"{_urgency_emoji(str(item.get('urgency') or 'low'))} {_task_label(task)} #{task_id} — {reason}")
+        lines.append(f"{_due_bucket_emoji(task.get('due_date'), current.date())} {_task_label(task)} #{task_id} — {reason}")
         rendered_count += 1
+        if rendered_count >= 4:
+            break
+
+    undated_callout = payload.get("undated_callout")
+    if undated_callout is not None and rendered_count < 4:
+        if not isinstance(undated_callout, dict):
+            raise RuntimeError("undated_callout must be an object or null")
+        task_id_raw = undated_callout.get("id")
+        try:
+            task_id = int(task_id_raw)
+        except (TypeError, ValueError):
+            logger.warning("Briefing returned invalid undated task id payload: %r", task_id_raw)
+        else:
+            if task_id not in seen_ids:
+                task = undated_lookup.get(task_id)
+                if not task:
+                    logger.warning("Briefing selected undated task id not in open_tasks: %s", task_id)
+                else:
+                    reason = _normalize_whitespace(str(undated_callout.get("reason") or ""))
+                    if not reason:
+                        raise RuntimeError(f"Briefing reason missing for task #{task_id}")
+                    lines.append(f"⚪ {_task_label(task)} #{task_id} — {reason}")
+                    rendered_count += 1
 
     if rendered_count == 0:
         raise RuntimeError("Briefing selected no valid open tasks")
 
-    opening_nudge = _normalize_whitespace(str(payload.get("opening_nudge") or ""))
-    if not opening_nudge:
-        raise RuntimeError("Briefing opening_nudge is missing")
-    lines.append("")
-    lines.append(f"👉 {opening_nudge}")
     return "\n".join(lines)
 
 
-def _simple_fallback_briefing(open_tasks: list[dict[str, Any]], now: Optional[datetime] = None) -> str:
+def _simple_fallback_briefing(
+    open_tasks: list[dict[str, Any]],
+    due_tasks: list[dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> str:
     current = _current_time(now)
     date_line = f"🌅 {current.strftime('%B %-d, %A')}"
     lines = [date_line, ""]
-    if current.weekday() >= 5:
-        lines.append("It's the weekend — only tackle these if you feel like it.")
+    if current.weekday() == 0:
+        lines.append(MONDAY_TRIAGE_LINE)
         lines.append("")
-    if not open_tasks:
+    due_lines = _render_due_section(due_tasks, current)
+    if due_lines:
+        lines.extend(due_lines)
+    else:
         lines[-1:] = [] if lines[-1:] == [""] else lines[-1:]
-        return f"🌅 {current.strftime('%B %-d, %A')} — No open tasks. Enjoy your morning."
-
-    top_tasks = open_tasks[:3]
-    for task in top_tasks:
-        lines.append(f"• {_task_label(task)} #{task['id']}")
-    lines.append("")
-    lines.append("⚠️ Briefing generation failed, showing fallback view.")
     return "\n".join(lines)
 
 
@@ -310,24 +437,26 @@ def save_briefing_entry(briefing_text: str, now: Optional[datetime] = None) -> i
     current = _current_time(now)
     title = BRIEFING_TITLE_TEMPLATE.format(date=current.strftime('%Y-%m-%d'))
     with engine.begin() as conn:
+        params = {
+            "content": briefing_text,
+            "tags": ["Briefing"],
+            "who": "System",
+            "who_ids": resolve_who_to_ids_safe("System", conn),
+            "title": title,
+            "language": "en",
+            "entry_type": "briefing",
+            "status": None,
+            "source": "briefing",
+        }
         row = conn.execute(
             text(
                 """
-                INSERT INTO entries (content, tags, who, title, language, type, status, source)
-                VALUES (:content, :tags, :who, :title, :language, :entry_type, :status, :source)
+                INSERT INTO entries (content, tags, who, who_ids, title, language, type, status, source)
+                VALUES (:content, :tags, :who, :who_ids, :title, :language, :entry_type, :status, :source)
                 RETURNING id
                 """
             ),
-            {
-                "content": briefing_text,
-                "tags": ["Briefing"],
-                "who": "System",
-                "title": title,
-                "language": "en",
-                "entry_type": "briefing",
-                "status": None,
-                "source": "briefing",
-            },
+            params,
         ).scalar_one()
     return int(row)
 
@@ -336,27 +465,38 @@ def generate_and_store_daily_briefing(now: Optional[datetime] = None) -> Briefin
     with track_job("briefing"):
         current = _current_time(now)
         open_tasks = fetch_open_tasks()
-        allowed_ids = {int(task["id"]) for task in open_tasks}
+        due_tasks = fetch_due_tasks(current)
+        allowed_ids = {int(task["id"]) for task in open_tasks} | {int(task["id"]) for task in due_tasks}
         if not open_tasks:
-            text_value = f"🌅 {current.strftime('%B %-d, %A')} — No open tasks. Enjoy your morning."
+            lines = [f"🌅 {current.strftime('%B %-d, %A')}", ""]
+            if current.weekday() == 0:
+                lines.append(MONDAY_TRIAGE_LINE)
+                lines.append("")
+            due_lines = _render_due_section(due_tasks, current)
+            if due_lines:
+                lines.extend(due_lines)
+                text_value = "\n".join(lines)
+            else:
+                lines.append("No open tasks. Enjoy your morning.")
+                text_value = "\n".join(lines)
             entry_id = save_briefing_entry(text_value, current)
             return BriefingResult(date_label=_date_label(current), briefing_text=text_value, entry_id=entry_id, used_llm=False)
 
         yesterday_entries = fetch_yesterday_entries(current)
         fresh_ideas = fetch_recent_ideas(current)
-        prompt = build_briefing_prompt(open_tasks, yesterday_entries, fresh_ideas, current)
+        prompt = build_briefing_prompt(open_tasks, due_tasks, yesterday_entries, fresh_ideas, current)
 
         used_llm = False
         try:
             payload = _generate_briefing_payload(prompt)
-            text_value = _render_structured_briefing(payload, open_tasks, current)
+            text_value = _render_structured_briefing(payload, open_tasks, due_tasks, current)
             text_value = _validate_briefing_ids(text_value, allowed_ids)
             if not _briefing_task_lines_have_ids(text_value):
                 raise RuntimeError("Briefing task lines are missing task IDs")
             used_llm = True
         except Exception as exc:
             logger.warning("Daily briefing LLM failed, using fallback: %s", exc)
-            text_value = _simple_fallback_briefing(open_tasks, current)
+            text_value = _simple_fallback_briefing(open_tasks, due_tasks, current)
 
         entry_id = save_briefing_entry(text_value, current)
         return BriefingResult(date_label=_date_label(current), briefing_text=text_value, entry_id=entry_id, used_llm=used_llm)
